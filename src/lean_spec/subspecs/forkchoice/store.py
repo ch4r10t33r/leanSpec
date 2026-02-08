@@ -30,7 +30,6 @@ from lean_spec.subspecs.containers import (
 from lean_spec.subspecs.containers.attestation.attestation import SignedAggregatedAttestation
 from lean_spec.subspecs.containers.block import BlockLookup
 from lean_spec.subspecs.containers.slot import Slot
-from lean_spec.subspecs.networking import compute_subnet_id
 from lean_spec.subspecs.ssz.hash import hash_tree_root
 from lean_spec.subspecs.xmss.aggregation import (
     AggregatedSignatureProof,
@@ -403,10 +402,10 @@ class Store(Container):
 
         if is_aggregator:
             assert self.validator_id is not None, "Current validator ID must be set for aggregation"
-            current_validator_subnet = compute_subnet_id(
-                self.validator_id, ATTESTATION_COMMITTEE_COUNT
+            current_validator_subnet = self.validator_id.compute_subnet_id(
+                ATTESTATION_COMMITTEE_COUNT
             )
-            attester_subnet = compute_subnet_id(validator_id, ATTESTATION_COMMITTEE_COUNT)
+            attester_subnet = validator_id.compute_subnet_id(ATTESTATION_COMMITTEE_COUNT)
             if current_validator_subnet != attester_subnet:
                 # Not part of our committee; ignore for committee aggregation.
                 pass
@@ -661,11 +660,11 @@ class Store(Container):
         # as the current validator.
         if self.validator_id is not None:
             proposer_validator_id = proposer_attestation.validator_id
-            proposer_subnet_id = compute_subnet_id(
-                proposer_validator_id, ATTESTATION_COMMITTEE_COUNT
+            proposer_subnet_id = proposer_validator_id.compute_subnet_id(
+                ATTESTATION_COMMITTEE_COUNT
             )
-            current_validator_subnet_id = compute_subnet_id(
-                self.validator_id, ATTESTATION_COMMITTEE_COUNT
+            current_validator_subnet_id = self.validator_id.compute_subnet_id(
+                ATTESTATION_COMMITTEE_COUNT
             )
             if proposer_subnet_id == current_validator_subnet_id:
                 proposer_sig_key = SignatureKey(
@@ -980,6 +979,7 @@ class Store(Container):
             # Note: here we should broadcast the aggregated signature to committee_aggregators topic
 
         # Compute new aggregated payloads
+        new_gossip_sigs = dict(self.gossip_signatures)
         for aggregated_attestation, aggregated_signature in aggregated_results:
             data_root = aggregated_attestation.data.data_root_bytes()
             validator_ids = aggregated_signature.participants.to_validator_indices()
@@ -988,7 +988,17 @@ class Store(Container):
                 if sig_key not in new_aggregated_payloads:
                     new_aggregated_payloads[sig_key] = []
                 new_aggregated_payloads[sig_key].append(aggregated_signature)
-        return self.model_copy(update={"latest_new_aggregated_payloads": new_aggregated_payloads})
+
+                # Prune successfully aggregated signature from gossip map
+                if sig_key in new_gossip_sigs:
+                    del new_gossip_sigs[sig_key]
+
+        return self.model_copy(
+            update={
+                "latest_new_aggregated_payloads": new_aggregated_payloads,
+                "gossip_signatures": new_gossip_sigs,
+            }
+        )
 
     def tick_interval(self, has_proposal: bool, is_aggregator: bool = False) -> "Store":
         """
