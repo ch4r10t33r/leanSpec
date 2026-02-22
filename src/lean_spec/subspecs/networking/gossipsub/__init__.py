@@ -19,30 +19,29 @@ References:
 ----------
 - Gossipsub v1.0: https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md
 - Gossipsub v1.2: https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.2.md
-- Ethereum P2P: https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md
+- Ethereum P2P: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md
 """
 
-from ..transport import PeerId
 from .behavior import (
     GossipsubBehavior,
-)
-from .control import (
-    ControlMessage,
-    Graft,
-    IDontWant,
-    IHave,
-    IWant,
-    Prune,
 )
 from .message import GossipsubMessage
 from .parameters import (
     GossipsubParameters,
 )
+from .rpc import (
+    ControlGraft,
+    ControlIDontWant,
+    ControlIHave,
+    ControlIWant,
+    ControlMessage,
+    ControlPrune,
+    ProtobufDecodeError,
+)
 from .topic import (
     ForkMismatchError,
     GossipTopic,
     TopicKind,
-    format_topic_string,
     parse_topic_string,
 )
 from .types import (
@@ -59,18 +58,18 @@ __all__ = [
     # Topic (commonly needed for Ethereum)
     "GossipTopic",
     "TopicKind",
-    "format_topic_string",
     "parse_topic_string",
     "ForkMismatchError",
     # Types
     "MessageId",
     "TopicId",
-    "PeerId",
     # Control messages (for custom handlers)
     "ControlMessage",
-    "Graft",
-    "Prune",
-    "IHave",
-    "IWant",
-    "IDontWant",
+    "ControlGraft",
+    "ControlPrune",
+    "ControlIHave",
+    "ControlIWant",
+    "ControlIDontWant",
+    # Errors
+    "ProtobufDecodeError",
 ]

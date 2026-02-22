@@ -49,8 +49,30 @@ uvx tox                  # Everything (checks + tests + docs)
 - Google docstring style
 - Test files/functions must start with `test_`
 - **No example code in docstrings**: Do not include `Example:` sections with code blocks in docstrings. Keep documentation concise and focused on explaining *what* and *why*, not *how to use*. Unit tests serve as usage examples.
+- **No section separator comments**: Never use banner-style separator comments (`# ====...`, `# ----...`, or similar). They add visual clutter with no value. Use blank lines to separate logical sections. If a section needs a heading, a single `#` comment line is enough.
+- **CRITICAL - Preserve existing documentation**: When refactoring or modifying code, NEVER remove or rewrite existing comments and docstrings unless they are directly invalidated by the code change. Removing documentation that still applies creates unnecessary noise in code review diffs and destroys context that was carefully written. Only modify documentation when:
+  - The documented behavior has actually changed
+  - The comment references code that no longer exists
+  - The comment is factually wrong after your change
 
 ### Import Style
+
+**All imports must be at the top of the file.** Never place imports inside functions, methods, or conditional blocks. This applies to both source code and tests. If a circular dependency exists, restructure the code to break the cycle rather than using a lazy import.
+
+Bad:
+```python
+def process(data):
+    from lean_spec.subspecs.ssz import hash_tree_root
+    return hash_tree_root(data)
+```
+
+Good:
+```python
+from lean_spec.subspecs.ssz import hash_tree_root
+
+def process(data):
+    return hash_tree_root(data)
+```
 
 **Avoid confusing import renames.** When an external library exports a name that conflicts with a local type, prefer restructuring over renaming.
 
@@ -80,6 +102,30 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 ```
 
 This keeps code readable and avoids mental overhead of tracking renamed imports.
+
+### Type Annotations
+
+**Never quote type annotations when `from __future__ import annotations` is present.** With future annotations, all annotations are already lazy strings. Adding quotes is redundant and noisy.
+
+Bad:
+```python
+from __future__ import annotations
+
+def create(cls) -> "Store":
+    ...
+```
+
+Good:
+```python
+from __future__ import annotations
+
+def create(cls) -> Store:
+    ...
+```
+
+The only valid use of quoted annotations is in files that do NOT have `from __future__ import annotations` and need a forward reference. Prefer adding the future import instead.
+
+**Prefer narrow domain types over raw builtins.** Use `Bytes32`, `Bytes33`, `Bytes52` etc. instead of `bytes` in signatures. Spec code should never accept or return `bytes` when a more specific type exists.
 
 ### Module-Level Constants
 
@@ -194,6 +240,46 @@ Wait for shutdown signal then stop services.
 Runs alongside the services.
 When shutdown is signaled, stops all services gracefully.
 """
+```
+
+### Testing Style (CRITICAL)
+
+**Always use full equality assertions.** Never assert individual fields when you can assert the whole object. This catches more bugs and replaces multiple lines with a single, complete check.
+
+Bad:
+```python
+assert len(capture.sent) == 1
+_, rpc = capture.sent[0]
+assert rpc.control is not None
+assert len(rpc.control.prune) == 1
+```
+
+Good:
+```python
+assert capture.sent == [
+    (peer_id, RPC(control=ControlMessage(prune=[ControlPrune(topic_id=topic, backoff=60)])))
+]
+```
+
+Bad:
+```python
+event = queue.get_nowait()
+assert event.peer_id == peer_id
+assert event.topic == "topic"
+```
+
+Good:
+```python
+assert queue.get_nowait() == GossipsubPeerEvent(
+    peer_id=peer_id, topic="topic", subscribed=True
+)
+```
+
+When order is non-deterministic (random peer selection), assert exact RPC shape and exact peer set separately:
+```python
+expected_rpc = RPC(control=ControlMessage(graft=[ControlGraft(topic_id=topic)]))
+assert {p for p, _ in capture.sent} == expected_peers
+assert all(rpc == expected_rpc for _, rpc in capture.sent)
 ```
 
 ## Test Framework Structure

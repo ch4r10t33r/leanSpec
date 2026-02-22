@@ -7,13 +7,11 @@ References:
     - https://github.com/ethereum/devp2p/blob/master/discv5/discv5-theory.md
 """
 
+from __future__ import annotations
+
 from typing import Final
 
 from lean_spec.types import StrictBaseModel
-
-# Protocol Constants
-# ------------------
-# Values derived from the Discovery v5 specification and Kademlia design.
 
 K_BUCKET_SIZE: Final = 16
 """Nodes per k-bucket. Standard Kademlia value balancing table size and lookup efficiency."""

@@ -7,6 +7,8 @@ See https://eprint.iacr.org/2023/323.
 Uses numpy arrays for vectorized field operations.
 """
 
+from __future__ import annotations
+
 from typing import Final, Self
 
 import numpy as np
@@ -19,10 +21,6 @@ from .constants import (
     ROUND_CONSTANTS_16,
     ROUND_CONSTANTS_24,
 )
-
-# =================================================================
-# Constants & Type Definitions
-# =================================================================
 
 type State = NDArray[np.int64]
 """State vector as signed 64-bit integers."""
@@ -42,11 +40,6 @@ Base 4x4 MDS matrix, pre-transposed.
 
 Pre-transposition enables efficient row-vector multiplication: `v @ M.T`.
 """
-
-
-# =================================================================
-# Poseidon2 Parameter Definitions
-# =================================================================
 
 
 class Poseidon2Params(StrictBaseModel):
@@ -75,11 +68,6 @@ class Poseidon2Params(StrictBaseModel):
             raise ValueError("Incorrect number of round constants provided.")
 
         return self
-
-
-# =================================================================
-# The Engine
-# =================================================================
 
 
 class Poseidon2:
@@ -254,10 +242,6 @@ class Poseidon2:
         # new_state[i] = state_sum + diag_vector[i] * state[i]
         return (state_sum + (self._diag_vector * state)) % P
 
-
-# =================================================================
-# Pre-defined Configurations
-# =================================================================
 
 # Parameters for WIDTH = 16
 PARAMS_16 = Poseidon2Params(

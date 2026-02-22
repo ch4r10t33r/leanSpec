@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,7 +15,7 @@ from lean_spec.subspecs.networking import PeerId
 from lean_spec.subspecs.ssz.hash import hash_tree_root
 from lean_spec.subspecs.sync.backfill_sync import BackfillSync
 from lean_spec.subspecs.sync.block_cache import BlockCache
-from lean_spec.subspecs.sync.head_sync import HeadSync
+from lean_spec.subspecs.sync.head_sync import HeadSync, HeadSyncResult
 from lean_spec.types import Bytes32
 from tests.lean_spec.helpers import make_signed_block
 
@@ -43,7 +42,7 @@ class TestGossipBlockProcessing:
         mock_store.blocks[genesis_root] = genesis_block
         return genesis_root, cast(Store, mock_store)
 
-    def test_block_with_known_parent_processed_immediately(
+    async def test_block_with_known_parent_processed_immediately(
         self,
         genesis_setup: tuple[Bytes32, Store],
         peer_id: PeerId,
@@ -72,14 +71,17 @@ class TestGossipBlockProcessing:
         )
         block_root = hash_tree_root(block.message.block)
 
-        result, new_store = asyncio.run(head_sync.on_gossip_block(block, peer_id, store))
+        result, new_store = await head_sync.on_gossip_block(block, peer_id, store)
 
-        assert result.processed is True
-        assert result.cached is False
-        assert result.backfill_triggered is False
+        assert result == HeadSyncResult(
+            processed=True,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=0,
+        )
         assert block_root in processed_blocks
 
-    def test_block_with_unknown_parent_cached_and_triggers_backfill(
+    async def test_block_with_unknown_parent_cached_and_triggers_backfill(
         self,
         peer_id: PeerId,
     ) -> None:
@@ -103,16 +105,19 @@ class TestGossipBlockProcessing:
         )
         block_root = hash_tree_root(block.message.block)
 
-        result, _ = asyncio.run(head_sync.on_gossip_block(block, peer_id, store))
+        result, _ = await head_sync.on_gossip_block(block, peer_id, store)
 
-        assert result.processed is False
-        assert result.cached is True
-        assert result.backfill_triggered is True
+        assert result == HeadSyncResult(
+            processed=False,
+            cached=True,
+            backfill_triggered=True,
+            descendants_processed=0,
+        )
         assert block_root in head_sync.block_cache
         assert head_sync.block_cache.orphan_count == 1
         backfill.fill_missing.assert_called_once_with([unknown_parent])
 
-    def test_duplicate_block_skipped(
+    async def test_duplicate_block_skipped(
         self,
         genesis_setup: tuple[Bytes32, Store],
         peer_id: PeerId,
@@ -137,17 +142,21 @@ class TestGossipBlockProcessing:
             process_block=process_block,
         )
 
-        result, _ = asyncio.run(head_sync.on_gossip_block(block, peer_id, store))
+        result, _ = await head_sync.on_gossip_block(block, peer_id, store)
 
-        assert result.processed is False
-        assert result.cached is False
+        assert result == HeadSyncResult(
+            processed=False,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=0,
+        )
         process_block.assert_not_called()
 
 
 class TestDescendantProcessing:
     """Tests for processing cached descendants when parent arrives."""
 
-    def test_cached_children_processed_when_parent_arrives(
+    async def test_cached_children_processed_when_parent_arrives(
         self,
         genesis_block,
         peer_id: PeerId,
@@ -193,14 +202,18 @@ class TestDescendantProcessing:
         )
 
         # Process parent - should trigger child processing
-        result, _ = asyncio.run(head_sync.on_gossip_block(parent, peer_id, store))
+        result, _ = await head_sync.on_gossip_block(parent, peer_id, store)
 
-        assert result.processed is True
-        assert result.descendants_processed == 1
+        assert result == HeadSyncResult(
+            processed=True,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=1,
+        )
         assert processing_order == [parent_root, child_root]
         assert child_root not in block_cache  # Removed after processing
 
-    def test_chain_of_descendants_processed_in_slot_order(
+    async def test_chain_of_descendants_processed_in_slot_order(
         self,
         genesis_block,
         peer_id: PeerId,
@@ -243,17 +256,21 @@ class TestDescendantProcessing:
         )
 
         # Process first block - should cascade to all descendants
-        result, _ = asyncio.run(head_sync.on_gossip_block(blocks[0], peer_id, store))
+        result, _ = await head_sync.on_gossip_block(blocks[0], peer_id, store)
 
-        assert result.processed is True
-        assert result.descendants_processed == 3
+        assert result == HeadSyncResult(
+            processed=True,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=3,
+        )
         assert processing_order == [1, 2, 3, 4]
 
 
 class TestProcessAllProcessable:
     """Tests for batch processing of processable blocks."""
 
-    def test_processes_all_blocks_with_known_parents(
+    async def test_processes_all_blocks_with_known_parents(
         self,
         genesis_block,
         peer_id: PeerId,
@@ -296,13 +313,13 @@ class TestProcessAllProcessable:
             process_block=count_processing,
         )
 
-        count, _ = asyncio.run(head_sync.process_all_processable(store))
+        count, _ = await head_sync.process_all_processable(store)
 
         assert count == 2
         assert processed_count == 2
         assert len(block_cache) == 0  # Both removed
 
-    def test_processing_failure_removes_block_from_cache(
+    async def test_processing_failure_removes_block_from_cache(
         self,
         genesis_block,
         peer_id: PeerId,
@@ -331,7 +348,7 @@ class TestProcessAllProcessable:
             process_block=fail_processing,
         )
 
-        count, _ = asyncio.run(head_sync.process_all_processable(store))
+        count, _ = await head_sync.process_all_processable(store)
 
         assert count == 0
         assert block_root not in block_cache  # Removed despite failure
@@ -340,7 +357,7 @@ class TestProcessAllProcessable:
 class TestErrorHandling:
     """Tests for error handling during block processing."""
 
-    def test_processing_error_captured_in_result(
+    async def test_processing_error_captured_in_result(
         self,
         genesis_block,
         peer_id: PeerId,
@@ -366,13 +383,18 @@ class TestErrorHandling:
             state_root=Bytes32.zero(),
         )
 
-        result, returned_store = asyncio.run(head_sync.on_gossip_block(block, peer_id, store))
+        result, returned_store = await head_sync.on_gossip_block(block, peer_id, store)
 
-        assert result.processed is False
-        assert result.error == "State transition failed"
+        assert result == HeadSyncResult(
+            processed=False,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=0,
+            error="State transition failed",
+        )
         assert returned_store is store  # Original store returned on error
 
-    def test_sibling_error_does_not_block_other_siblings(
+    async def test_sibling_error_does_not_block_other_siblings(
         self,
         genesis_block,
         peer_id: PeerId,
@@ -420,8 +442,178 @@ class TestErrorHandling:
             process_block=fail_first,
         )
 
-        count, _ = asyncio.run(head_sync.process_all_processable(store))
+        count, _ = await head_sync.process_all_processable(store)
 
         assert call_count == 2  # Both attempted
         assert count == 1  # One succeeded
         assert len(successful_roots) == 1
+
+
+class TestStorePropagation:
+    """Tests for store propagation through descendant processing."""
+
+    async def test_store_propagated_through_descendant_chain(
+        self,
+        genesis_block,
+        peer_id: PeerId,
+    ) -> None:
+        """Returned store contains ALL processed blocks, not just the parent."""
+        genesis_root = hash_tree_root(genesis_block)
+        store = cast(Store, MockStore({genesis_root}))
+        store.blocks[genesis_root] = genesis_block
+        block_cache = BlockCache()
+
+        # Build chain: parent -> child1 -> child2
+        parent = make_signed_block(
+            slot=Slot(1),
+            proposer_index=ValidatorIndex(0),
+            parent_root=genesis_root,
+            state_root=Bytes32(b"\x01" * 32),
+        )
+        parent_root = hash_tree_root(parent.message.block)
+
+        child1 = make_signed_block(
+            slot=Slot(2),
+            proposer_index=ValidatorIndex(0),
+            parent_root=parent_root,
+            state_root=Bytes32(b"\x02" * 32),
+        )
+        child1_root = hash_tree_root(child1.message.block)
+
+        child2 = make_signed_block(
+            slot=Slot(3),
+            proposer_index=ValidatorIndex(0),
+            parent_root=child1_root,
+            state_root=Bytes32(b"\x03" * 32),
+        )
+        child2_root = hash_tree_root(child2.message.block)
+
+        # Pre-cache descendants.
+        block_cache.add(child1, peer_id)
+        block_cache.add(child2, peer_id)
+
+        def track_processing(s: Any, block: SignedBlockWithAttestation) -> Any:
+            root = hash_tree_root(block.message.block)
+            new_store = MockStore(set(s.blocks.keys()) | {root})
+            return new_store
+
+        head_sync = HeadSync(
+            block_cache=block_cache,
+            backfill=MagicMock(spec=BackfillSync),
+            process_block=track_processing,
+        )
+
+        result, new_store = await head_sync.on_gossip_block(parent, peer_id, store)
+
+        assert result == HeadSyncResult(
+            processed=True,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=2,
+        )
+        assert {parent_root, child1_root, child2_root} <= set(new_store.blocks.keys())
+
+
+class TestReentrantGuard:
+    """Tests for reentrant processing guard."""
+
+    async def test_reentrant_call_returns_not_processed(
+        self,
+        genesis_block,
+        peer_id: PeerId,
+    ) -> None:
+        """Block already in _processing returns processed=False, cached=False."""
+        genesis_root = hash_tree_root(genesis_block)
+        store = cast(Store, MockStore({genesis_root}))
+        store.blocks[genesis_root] = genesis_block
+
+        head_sync = HeadSync(
+            block_cache=BlockCache(),
+            backfill=MagicMock(spec=BackfillSync),
+            process_block=MagicMock(),
+        )
+
+        block = make_signed_block(
+            slot=Slot(1),
+            proposer_index=ValidatorIndex(0),
+            parent_root=genesis_root,
+            state_root=Bytes32.zero(),
+        )
+        block_root = hash_tree_root(block.message.block)
+
+        # Simulate reentrant call by pre-adding to _processing.
+        head_sync._processing.add(block_root)
+
+        result, returned_store = await head_sync.on_gossip_block(block, peer_id, store)
+
+        assert result == HeadSyncResult(
+            processed=False,
+            cached=False,
+            backfill_triggered=False,
+            descendants_processed=0,
+        )
+        assert returned_store is store
+        cast(MagicMock, head_sync.process_block).assert_not_called()
+
+
+class TestProcessAllProcessableConvergence:
+    """Tests for process_all_processable convergence."""
+
+    async def test_chain_processed_in_single_call(
+        self,
+        genesis_block,
+        peer_id: PeerId,
+    ) -> None:
+        """Chain A -> B -> C all processed in one process_all_processable call."""
+        genesis_root = hash_tree_root(genesis_block)
+        store = cast(Store, MockStore({genesis_root}))
+        store.blocks[genesis_root] = genesis_block
+        block_cache = BlockCache()
+
+        # Build chain: A -> B -> C, all with genesis as ultimate ancestor.
+        block_a = make_signed_block(
+            slot=Slot(1),
+            proposer_index=ValidatorIndex(0),
+            parent_root=genesis_root,
+            state_root=Bytes32(b"\x01" * 32),
+        )
+        root_a = hash_tree_root(block_a.message.block)
+
+        block_b = make_signed_block(
+            slot=Slot(2),
+            proposer_index=ValidatorIndex(0),
+            parent_root=root_a,
+            state_root=Bytes32(b"\x02" * 32),
+        )
+        root_b = hash_tree_root(block_b.message.block)
+
+        block_c = make_signed_block(
+            slot=Slot(3),
+            proposer_index=ValidatorIndex(0),
+            parent_root=root_b,
+            state_root=Bytes32(b"\x03" * 32),
+        )
+
+        block_cache.add(block_a, peer_id)
+        block_cache.add(block_b, peer_id)
+        block_cache.add(block_c, peer_id)
+
+        processing_order: list[int] = []
+
+        def track_processing(s: Any, block: SignedBlockWithAttestation) -> Any:
+            processing_order.append(int(block.message.block.slot))
+            root = hash_tree_root(block.message.block)
+            new_store = MockStore(set(s.blocks.keys()) | {root})
+            return new_store
+
+        head_sync = HeadSync(
+            block_cache=block_cache,
+            backfill=MagicMock(spec=BackfillSync),
+            process_block=track_processing,
+        )
+
+        count, _ = await head_sync.process_all_processable(store)
+
+        assert count == 3
+        assert processing_order == [1, 2, 3]
+        assert len(block_cache) == 0

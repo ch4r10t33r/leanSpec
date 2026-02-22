@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from lean_spec.subspecs.chain.config import VALIDATOR_REGISTRY_LIMIT
+from lean_spec.subspecs.containers.validator import ValidatorIndex, ValidatorIndices
 from lean_spec.types import Boolean
 from lean_spec.types.bitfields import BaseBitlist
-
-if TYPE_CHECKING:
-    from lean_spec.subspecs.containers.validator import ValidatorIndex, ValidatorIndices
 
 
 class AggregationBits(BaseBitlist):
@@ -23,15 +19,12 @@ class AggregationBits(BaseBitlist):
     LIMIT = int(VALIDATOR_REGISTRY_LIMIT)
 
     @classmethod
-    def from_validator_indices(
-        cls, indices: "ValidatorIndices | list[ValidatorIndex]"
-    ) -> AggregationBits:
+    def from_validator_indices(cls, indices: ValidatorIndices) -> AggregationBits:
         """
         Construct aggregation bits from a set of validator indices.
 
         Args:
-            indices: Validator indices to set in the bitlist. Accepts either
-                a ValidatorIndices collection or a plain list of ValidatorIndex.
+            indices: Validator indices to set in the bitlist.
 
         Returns:
             AggregationBits with the corresponding indices set to True.
@@ -40,11 +33,7 @@ class AggregationBits(BaseBitlist):
             AssertionError: If no indices are provided.
             AssertionError: If any index is outside the supported LIMIT.
         """
-        # Import here to avoid circular dependency
-        from lean_spec.subspecs.containers.validator import ValidatorIndices
-
-        # Extract list from ValidatorIndices if needed
-        index_list = indices.data if isinstance(indices, ValidatorIndices) else indices
+        index_list = indices.data
 
         # Require at least one validator for a valid aggregation.
         if not index_list:
@@ -64,7 +53,7 @@ class AggregationBits(BaseBitlist):
         # - False elsewhere.
         return cls(data=[Boolean(i in ids) for i in range(max_id + 1)])
 
-    def to_validator_indices(self) -> "ValidatorIndices":
+    def to_validator_indices(self) -> ValidatorIndices:
         """
         Extract all validator indices encoded in these aggregation bits.
 
@@ -74,9 +63,6 @@ class AggregationBits(BaseBitlist):
         Raises:
             AssertionError: If no bits are set.
         """
-        # Import here to avoid circular dependency
-        from lean_spec.subspecs.containers.validator import ValidatorIndex, ValidatorIndices
-
         # Extract indices where bit is set; fail if none found.
         indices = [ValidatorIndex(i) for i, bit in enumerate(self.data) if bool(bit)]
         if not indices:

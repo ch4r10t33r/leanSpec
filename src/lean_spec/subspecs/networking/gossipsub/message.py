@@ -33,8 +33,8 @@ Ethereum consensus uses a custom message ID function based on SHA256::
 
 **Domain Bytes:**
 
-- ``0x01`` (VALID_SNAPPY): Snappy decompression succeeded, use decompressed data
-- ``0x00`` (INVALID_SNAPPY): Decompression failed or no decompressor, use raw data
+- ``0x01000000`` (VALID_SNAPPY): Snappy decompression succeeded, use decompressed data
+- ``0x00000000`` (INVALID_SNAPPY): Decompression failed or no decompressor, use raw data
 
 This ensures messages with compression issues get different IDs,
 preventing cache pollution from invalid variants.
@@ -48,51 +48,28 @@ which domain byte to use.
 
 References:
 ----------
-- `Ethereum P2P spec <https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md>`_
+- `Ethereum P2P spec <https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md>`_
 - `Gossipsub v1.0 <https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md>`_
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
 
 from lean_spec.subspecs.networking.config import (
     MESSAGE_DOMAIN_INVALID_SNAPPY,
     MESSAGE_DOMAIN_VALID_SNAPPY,
 )
-from lean_spec.types import Bytes20
 
 from .types import MessageId
 
+type SnappyDecompressor = Callable[[bytes], bytes]
+"""Callable that decompresses snappy-compressed data.
 
-@runtime_checkable
-class SnappyDecompressor(Protocol):
-    """Protocol for snappy decompression functions.
-
-    Any callable matching this signature can be used for decompression.
-    The function should raise an exception if decompression fails.
-    """
-
-    def __call__(self, data: bytes) -> bytes:
-        """Decompress snappy-compressed data.
-
-        Args:
-            data: Compressed bytes.
-
-        Returns:
-            Decompressed bytes.
-
-        Raises:
-            Exception: If decompression fails.
-        """
-        ...
-
-
-# =============================================================================
-# Gossipsub Message
-# =============================================================================
+Should raise an exception if decompression fails.
+"""
 
 
 @dataclass(slots=True)
@@ -113,10 +90,7 @@ class GossipsubMessage:
     """
 
     topic: bytes
-    """Topic string as UTF-8 encoded bytes.
-
-    Example: ``b"/leanconsensus/0x12345678/block/ssz_snappy"``
-    """
+    """Topic string as UTF-8 encoded bytes."""
 
     raw_data: bytes
     """Raw message payload.
@@ -161,6 +135,8 @@ class GossipsubMessage:
         topic: bytes,
         data: bytes,
         snappy_decompress: SnappyDecompressor | None = None,
+        *,
+        domain: bytes | None = None,
     ) -> MessageId:
         """Compute a 20-byte message ID from raw data.
 
@@ -171,6 +147,8 @@ class GossipsubMessage:
         Domain Selection
         ----------------
 
+        - If `domain` is explicitly provided:
+            use it directly (data is assumed pre-processed by the caller)
         - If `snappy_decompress` is provided and succeeds:
             domain = 0x01, use decompressed data
         - Otherwise:
@@ -180,11 +158,15 @@ class GossipsubMessage:
             topic: Topic string as bytes.
             data: Message payload (potentially compressed).
             snappy_decompress: Optional decompression function.
+            domain: Explicit domain bytes. When provided, data is used as-is.
 
         Returns:
             20-byte message ID.
         """
-        if snappy_decompress is not None:
+        if domain is not None:
+            # Caller already determined the domain (e.g., after pre-decompression).
+            data_for_hash = data
+        elif snappy_decompress is not None:
             try:
                 data_for_hash = snappy_decompress(data)
                 domain = MESSAGE_DOMAIN_VALID_SNAPPY
@@ -197,16 +179,7 @@ class GossipsubMessage:
 
         preimage = bytes(domain) + len(topic).to_bytes(8, "little") + topic + data_for_hash
 
-        return Bytes20(hashlib.sha256(preimage).digest()[:20])
-
-    @property
-    def topic_str(self) -> str:
-        """Get the topic as a UTF-8 string.
-
-        Returns:
-            Topic decoded from bytes to string.
-        """
-        return self.topic.decode("utf-8")
+        return MessageId(hashlib.sha256(preimage).digest()[:20])
 
     def __hash__(self) -> int:
         """Hash based on message ID.

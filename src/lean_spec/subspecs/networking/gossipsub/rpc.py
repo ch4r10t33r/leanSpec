@@ -41,28 +41,25 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import Final
 
 from lean_spec.subspecs.networking.varint import decode_varint, encode_varint
 
-if TYPE_CHECKING:
-    pass
-
-
-# =============================================================================
-# Protobuf Wire Type Constants
-# =============================================================================
-
-WIRE_TYPE_VARINT = 0
+WIRE_TYPE_VARINT: Final = 0
 """Varint wire type for int32, int64, uint32, uint64, sint32, sint64, bool, enum."""
 
-WIRE_TYPE_LENGTH_DELIMITED = 2
+WIRE_TYPE_64BIT: Final = 1
+"""64-bit wire type for fixed64, sfixed64, double."""
+
+WIRE_TYPE_LENGTH_DELIMITED: Final = 2
 """Length-delimited wire type for string, bytes, embedded messages, packed repeated fields."""
 
+WIRE_TYPE_32BIT: Final = 5
+"""32-bit wire type for fixed32, sfixed32, float."""
 
-# =============================================================================
-# Internal Helpers
-# =============================================================================
+
+class ProtobufDecodeError(ValueError):
+    """Raised when protobuf data cannot be decoded."""
 
 
 def _decode_varint_at(data: bytes, pos: int) -> tuple[int, int]:
@@ -73,6 +70,23 @@ def _decode_varint_at(data: bytes, pos: int) -> tuple[int, int]:
     """
     value, consumed = decode_varint(data, pos)
     return value, pos + consumed
+
+
+def _decode_length_at(data: bytes, pos: int) -> tuple[int, int]:
+    """Decode a length varint and validate bounds.
+
+    Returns:
+        (length, new_position) tuple.
+
+    Raises:
+        ProtobufDecodeError: If the length exceeds available data.
+    """
+    length, new_pos = _decode_varint_at(data, pos)
+    if new_pos + length > len(data):
+        raise ProtobufDecodeError(
+            f"Length field {length} at position {pos} exceeds data size {len(data)}"
+        )
+    return length, new_pos
 
 
 def encode_tag(field_number: int, wire_type: int) -> bytes:
@@ -116,11 +130,6 @@ def encode_uint64(field_number: int, value: int) -> bytes:
     return encode_tag(field_number, WIRE_TYPE_VARINT) + encode_varint(value)
 
 
-# =============================================================================
-# Gossipsub Message Types
-# =============================================================================
-
-
 @dataclass(slots=True)
 class SubOpts:
     """Subscription option for a topic."""
@@ -152,11 +161,10 @@ class SubOpts:
                 value, pos = _decode_varint_at(data, pos)
                 subscribe = value != 0
             elif field_num == 2 and wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 topic_id = data[pos : pos + length].decode("utf-8")
                 pos += length
             else:
-                # Skip unknown field
                 pos = _skip_field(data, pos, wire_type)
 
         return cls(subscribe=subscribe, topic_id=topic_id)
@@ -211,7 +219,7 @@ class Message:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 field_data = data[pos : pos + length]
                 pos += length
 
@@ -263,7 +271,7 @@ class ControlIHave:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 field_data = data[pos : pos + length]
                 pos += length
 
@@ -301,7 +309,7 @@ class ControlIWant:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if field_num == 1 and wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 message_ids.append(data[pos : pos + length])
                 pos += length
             else:
@@ -334,7 +342,7 @@ class ControlGraft:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if field_num == 1 and wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 topic_id = data[pos : pos + length].decode("utf-8")
                 pos += length
             else:
@@ -344,7 +352,7 @@ class ControlGraft:
 
 
 @dataclass(slots=True)
-class PeerInfo:
+class PrunePeerInfo:
     """Peer information for PRUNE peer exchange."""
 
     peer_id: bytes = b""
@@ -363,7 +371,7 @@ class PeerInfo:
         return bytes(result)
 
     @classmethod
-    def decode(cls, data: bytes) -> PeerInfo:
+    def decode(cls, data: bytes) -> PrunePeerInfo:
         """Decode from protobuf."""
         peer_id = b""
         signed_peer_record = b""
@@ -373,7 +381,7 @@ class PeerInfo:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 field_data = data[pos : pos + length]
                 pos += length
 
@@ -394,7 +402,7 @@ class ControlPrune:
     topic_id: str = ""
     """Topic being pruned from."""
 
-    peers: list[PeerInfo] = field(default_factory=list)
+    peers: list[PrunePeerInfo] = field(default_factory=list)
     """Peer exchange - alternative peers for the topic (v1.1)."""
 
     backoff: int = 0
@@ -415,7 +423,7 @@ class ControlPrune:
     def decode(cls, data: bytes) -> ControlPrune:
         """Decode from protobuf."""
         topic_id = ""
-        peers: list[PeerInfo] = []
+        peers: list[PrunePeerInfo] = []
         backoff = 0
         pos = 0
 
@@ -423,12 +431,12 @@ class ControlPrune:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if field_num == 1 and wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 topic_id = data[pos : pos + length].decode("utf-8")
                 pos += length
             elif field_num == 2 and wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
-                peers.append(PeerInfo.decode(data[pos : pos + length]))
+                length, pos = _decode_length_at(data, pos)
+                peers.append(PrunePeerInfo.decode(data[pos : pos + length]))
                 pos += length
             elif field_num == 3 and wire_type == WIRE_TYPE_VARINT:
                 backoff, pos = _decode_varint_at(data, pos)
@@ -462,7 +470,7 @@ class ControlIDontWant:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if field_num == 1 and wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 message_ids.append(data[pos : pos + length])
                 pos += length
             else:
@@ -515,7 +523,7 @@ class ControlMessage:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 field_data = data[pos : pos + length]
                 pos += length
 
@@ -590,7 +598,7 @@ class RPC:
             field_num, wire_type, pos = decode_tag(data, pos)
 
             if wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-                length, pos = _decode_varint_at(data, pos)
+                length, pos = _decode_length_at(data, pos)
                 field_data = data[pos : pos + length]
                 pos += length
 
@@ -613,108 +621,44 @@ class RPC:
             and (self.control is None or self.control.is_empty())
         )
 
+    @classmethod
+    def subscription(cls, topics: list[str], subscribe: bool = True) -> RPC:
+        """
+        Create an RPC with subscription messages.
+
+        Args:
+            topics: List of topic IDs to subscribe/unsubscribe.
+            subscribe: True to subscribe, False to unsubscribe.
+        """
+        return cls(subscriptions=[SubOpts(subscribe=subscribe, topic_id=t) for t in topics])
+
+    @classmethod
+    def graft(cls, topics: list[str]) -> RPC:
+        """
+        Create an RPC with GRAFT control messages.
+
+        Args:
+            topics: List of topic IDs to request mesh membership for.
+        """
+        return cls(control=ControlMessage(graft=[ControlGraft(topic_id=t) for t in topics]))
+
 
 def _skip_field(data: bytes, pos: int, wire_type: int) -> int:
-    """Skip an unknown field based on wire type."""
+    """Skip an unknown field based on wire type.
+
+    Raises:
+        ProtobufDecodeError: If the wire type is unrecognized (e.g. deprecated
+            group types 3/4) and cannot be skipped.
+    """
     if wire_type == WIRE_TYPE_VARINT:
         _, pos = _decode_varint_at(data, pos)
     elif wire_type == WIRE_TYPE_LENGTH_DELIMITED:
-        length, pos = _decode_varint_at(data, pos)
+        length, pos = _decode_length_at(data, pos)
         pos += length
-    elif wire_type == 5:  # 32-bit fixed
+    elif wire_type == WIRE_TYPE_32BIT:
         pos += 4
-    elif wire_type == 1:  # 64-bit fixed
+    elif wire_type == WIRE_TYPE_64BIT:
         pos += 8
     else:
-        raise ValueError(f"Unknown wire type: {wire_type}")
+        raise ProtobufDecodeError(f"Unknown wire type: {wire_type}")
     return pos
-
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-
-def create_subscription_rpc(topics: list[str], subscribe: bool = True) -> RPC:
-    """
-    Create an RPC with subscription messages.
-
-    Args:
-        topics: List of topic IDs to subscribe/unsubscribe.
-        subscribe: True to subscribe, False to unsubscribe.
-
-    Returns:
-        RPC ready to be encoded and sent.
-    """
-    return RPC(subscriptions=[SubOpts(subscribe=subscribe, topic_id=t) for t in topics])
-
-
-def create_graft_rpc(topics: list[str]) -> RPC:
-    """
-    Create an RPC with GRAFT control messages.
-
-    Args:
-        topics: List of topic IDs to request mesh membership for.
-
-    Returns:
-        RPC ready to be encoded and sent.
-    """
-    return RPC(control=ControlMessage(graft=[ControlGraft(topic_id=t) for t in topics]))
-
-
-def create_prune_rpc(topics: list[str], backoff: int = 60) -> RPC:
-    """
-    Create an RPC with PRUNE control messages.
-
-    Args:
-        topics: List of topic IDs to notify mesh removal for.
-        backoff: Backoff duration in seconds before re-grafting.
-
-    Returns:
-        RPC ready to be encoded and sent.
-    """
-    return RPC(
-        control=ControlMessage(prune=[ControlPrune(topic_id=t, backoff=backoff) for t in topics])
-    )
-
-
-def create_ihave_rpc(topic_id: str, message_ids: list[bytes]) -> RPC:
-    """
-    Create an RPC with IHAVE control message.
-
-    Args:
-        topic_id: Topic the messages belong to.
-        message_ids: Message IDs to advertise.
-
-    Returns:
-        RPC ready to be encoded and sent.
-    """
-    ihave = ControlIHave(topic_id=topic_id, message_ids=message_ids)
-    return RPC(control=ControlMessage(ihave=[ihave]))
-
-
-def create_iwant_rpc(message_ids: list[bytes]) -> RPC:
-    """
-    Create an RPC with IWANT control message.
-
-    Args:
-        message_ids: Message IDs being requested.
-
-    Returns:
-        RPC ready to be encoded and sent.
-    """
-    return RPC(control=ControlMessage(iwant=[ControlIWant(message_ids=message_ids)]))
-
-
-def create_publish_rpc(topic: str, data: bytes) -> RPC:
-    """
-    Create an RPC with a published message.
-
-    Args:
-        topic: Topic to publish to.
-        data: Message payload.
-
-    Returns:
-        RPC ready to be encoded and sent.
-    """
-    return RPC(publish=[Message(topic=topic, data=data)])

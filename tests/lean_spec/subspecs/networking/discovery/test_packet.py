@@ -2,7 +2,9 @@
 
 import pytest
 
-from lean_spec.subspecs.networking.discovery.messages import PacketFlag
+from lean_spec.subspecs.networking.discovery.config import MAX_PACKET_SIZE, MIN_PACKET_SIZE
+from lean_spec.subspecs.networking.discovery.crypto import aes_ctr_encrypt
+from lean_spec.subspecs.networking.discovery.messages import IdNonce, Nonce, PacketFlag
 from lean_spec.subspecs.networking.discovery.packet import (
     HANDSHAKE_HEADER_SIZE,
     MESSAGE_AUTHDATA_SIZE,
@@ -16,9 +18,9 @@ from lean_spec.subspecs.networking.discovery.packet import (
     encode_message_authdata,
     encode_packet,
     encode_whoareyou_authdata,
-    generate_id_nonce,
-    generate_nonce,
 )
+from lean_spec.subspecs.networking.types import NodeId, SeqNumber
+from lean_spec.types import Bytes16, Bytes33, Bytes64
 
 
 class TestNonceGeneration:
@@ -26,18 +28,18 @@ class TestNonceGeneration:
 
     def test_generate_nonce_is_12_bytes(self):
         """Test that generated nonce is 12 bytes."""
-        nonce = generate_nonce()
+        nonce = Nonce.generate()
         assert len(nonce) == 12
 
     def test_generate_id_nonce_is_16_bytes(self):
         """Test that generated ID nonce is 16 bytes."""
-        id_nonce = generate_id_nonce()
+        id_nonce = IdNonce.generate()
         assert len(id_nonce) == 16
 
     def test_generates_different_nonces(self):
         """Test that each generation produces different nonces."""
-        nonce1 = generate_nonce()
-        nonce2 = generate_nonce()
+        nonce1 = Nonce.generate()
+        nonce2 = Nonce.generate()
         assert nonce1 != nonce2
 
 
@@ -46,7 +48,7 @@ class TestMessageAuthdata:
 
     def test_encode_message_authdata(self):
         """Test MESSAGE authdata encoding."""
-        src_id = bytes(32)
+        src_id = NodeId(bytes(32))
         authdata = encode_message_authdata(src_id)
 
         assert len(authdata) == MESSAGE_AUTHDATA_SIZE
@@ -54,7 +56,7 @@ class TestMessageAuthdata:
 
     def test_decode_message_authdata(self):
         """Test MESSAGE authdata decoding."""
-        src_id = bytes.fromhex("aa" * 32)
+        src_id = NodeId(bytes.fromhex("aa" * 32))
         authdata = encode_message_authdata(src_id)
         decoded = decode_message_authdata(authdata)
 
@@ -71,8 +73,8 @@ class TestWhoAreYouAuthdata:
 
     def test_encode_whoareyou_authdata(self):
         """Test WHOAREYOU authdata encoding."""
-        id_nonce = bytes(16)
-        enr_seq = 42
+        id_nonce = IdNonce(bytes(16))
+        enr_seq = SeqNumber(42)
 
         authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
 
@@ -80,25 +82,25 @@ class TestWhoAreYouAuthdata:
 
     def test_decode_whoareyou_authdata(self):
         """Test WHOAREYOU authdata decoding."""
-        id_nonce = bytes.fromhex("aa" * 16)
-        enr_seq = 12345
+        id_nonce = IdNonce(bytes.fromhex("aa" * 16))
+        enr_seq = SeqNumber(12345)
 
         authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
         decoded = decode_whoareyou_authdata(authdata)
 
-        assert bytes(decoded.id_nonce) == id_nonce
-        assert int(decoded.enr_seq) == enr_seq
+        assert decoded.id_nonce == id_nonce
+        assert decoded.enr_seq == enr_seq
 
     def test_roundtrip(self):
         """Test encoding then decoding preserves values."""
-        id_nonce = bytes.fromhex("01" * 16)
-        enr_seq = 2**63 - 1  # Max uint64
+        id_nonce = IdNonce(bytes.fromhex("01" * 16))
+        enr_seq = SeqNumber(2**63 - 1)  # Max uint64
 
         authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
         decoded = decode_whoareyou_authdata(authdata)
 
-        assert bytes(decoded.id_nonce) == id_nonce
-        assert int(decoded.enr_seq) == enr_seq
+        assert decoded.id_nonce == id_nonce
+        assert decoded.enr_seq == enr_seq
 
     def test_invalid_size_raises(self):
         """Test that invalid authdata size raises ValueError."""
@@ -111,9 +113,9 @@ class TestHandshakeAuthdata:
 
     def test_encode_handshake_authdata(self):
         """Test HANDSHAKE authdata encoding."""
-        src_id = bytes(32)
-        id_signature = bytes(64)
-        eph_pubkey = bytes([0x02]) + bytes(32)  # Compressed pubkey format
+        src_id = NodeId(bytes(32))
+        id_signature = Bytes64(bytes(64))
+        eph_pubkey = Bytes33(bytes([0x02]) + bytes(32))
 
         authdata = encode_handshake_authdata(src_id, id_signature, eph_pubkey)
 
@@ -123,9 +125,9 @@ class TestHandshakeAuthdata:
 
     def test_decode_handshake_authdata(self):
         """Test HANDSHAKE authdata decoding."""
-        src_id = bytes.fromhex("aa" * 32)
-        id_signature = bytes.fromhex("bb" * 64)
-        eph_pubkey = bytes([0x02]) + bytes.fromhex("cc" * 32)
+        src_id = NodeId(bytes.fromhex("aa" * 32))
+        id_signature = Bytes64(bytes.fromhex("bb" * 64))
+        eph_pubkey = Bytes33(bytes([0x02]) + bytes.fromhex("cc" * 32))
 
         authdata = encode_handshake_authdata(src_id, id_signature, eph_pubkey)
         decoded = decode_handshake_authdata(authdata)
@@ -139,9 +141,9 @@ class TestHandshakeAuthdata:
 
     def test_with_enr_record(self):
         """Test HANDSHAKE authdata with ENR record."""
-        src_id = bytes(32)
-        id_signature = bytes(64)
-        eph_pubkey = bytes([0x02]) + bytes(32)
+        src_id = NodeId(bytes(32))
+        id_signature = Bytes64(bytes(64))
+        eph_pubkey = Bytes33(bytes([0x02]) + bytes(32))
         record = b"enr:-IS4QHCYrY..."  # Mock ENR
 
         authdata = encode_handshake_authdata(src_id, id_signature, eph_pubkey, record)
@@ -149,37 +151,21 @@ class TestHandshakeAuthdata:
 
         assert decoded.record == record
 
-    def test_invalid_src_id_length_raises(self):
-        """Test that invalid src_id length raises ValueError."""
-        with pytest.raises(ValueError, match="Source ID must be 32 bytes"):
-            encode_handshake_authdata(bytes(31), bytes(64), bytes(33))
-
-    def test_invalid_signature_length_raises(self):
-        """Test that invalid signature length raises ValueError."""
-        with pytest.raises(ValueError, match="Signature must be 64 bytes"):
-            encode_handshake_authdata(bytes(32), bytes(63), bytes(33))
-
-    def test_invalid_eph_pubkey_length_raises(self):
-        """Test that invalid ephemeral pubkey length raises ValueError."""
-        with pytest.raises(ValueError, match="Ephemeral pubkey must be 33 bytes"):
-            encode_handshake_authdata(bytes(32), bytes(64), bytes(32))
-
 
 class TestPacketEncoding:
     """Tests for full packet encoding/decoding."""
 
     def test_encode_message_packet(self):
         """Test MESSAGE packet encoding."""
-        dest_node_id = bytes(32)
-        src_node_id = bytes(32)
-        nonce = bytes(12)
+        dest_node_id = NodeId(bytes(32))
+        src_node_id = NodeId(bytes(32))
+        nonce = Nonce(bytes(12))
         authdata = encode_message_authdata(src_node_id)
         message = b"encrypted message"
-        encryption_key = bytes(16)
+        encryption_key = Bytes16(bytes(16))
 
         packet = encode_packet(
             dest_node_id=dest_node_id,
-            src_node_id=src_node_id,
             flag=PacketFlag.MESSAGE,
             nonce=nonce,
             authdata=authdata,
@@ -192,20 +178,18 @@ class TestPacketEncoding:
 
     def test_encode_whoareyou_packet(self):
         """Test WHOAREYOU packet encoding."""
-        dest_node_id = bytes(32)
-        src_node_id = bytes(32)
-        nonce = bytes(12)
-        id_nonce = bytes(16)
-        authdata = encode_whoareyou_authdata(id_nonce, 0)
+        dest_node_id = NodeId(bytes(32))
+        nonce = Nonce(bytes(12))
+        id_nonce = IdNonce(bytes(16))
+        authdata = encode_whoareyou_authdata(id_nonce, SeqNumber(0))
 
         packet = encode_packet(
             dest_node_id=dest_node_id,
-            src_node_id=src_node_id,
             flag=PacketFlag.WHOAREYOU,
             nonce=nonce,
             authdata=authdata,
             message=b"",
-            encryption_key=None,  # WHOAREYOU doesn't encrypt
+            encryption_key=None,
         )
 
         # WHOAREYOU has no message content
@@ -214,14 +198,12 @@ class TestPacketEncoding:
 
     def test_decode_packet_header(self):
         """Test packet header decoding."""
-        local_node_id = bytes(32)
-        remote_node_id = bytes(32)
-        nonce = bytes(12)
-        authdata = encode_whoareyou_authdata(bytes(16), 42)
+        local_node_id = NodeId(bytes(32))
+        nonce = Nonce(bytes(12))
+        authdata = encode_whoareyou_authdata(IdNonce(bytes(16)), SeqNumber(42))
 
         packet = encode_packet(
             dest_node_id=local_node_id,
-            src_node_id=remote_node_id,
             flag=PacketFlag.WHOAREYOU,
             nonce=nonce,
             authdata=authdata,
@@ -229,38 +211,12 @@ class TestPacketEncoding:
             encryption_key=None,
         )
 
-        header, message_bytes = decode_packet_header(local_node_id, packet)
+        header, message_bytes, _message_ad = decode_packet_header(local_node_id, packet)
 
         assert header.flag == PacketFlag.WHOAREYOU
-        assert bytes(header.nonce) == nonce
+        assert header.nonce == nonce
         assert header.authdata == authdata
         assert message_bytes == b""
-
-    def test_invalid_dest_node_id_length_raises(self):
-        """Test that invalid dest_node_id length raises ValueError."""
-        with pytest.raises(ValueError, match="Destination node ID must be 32 bytes"):
-            encode_packet(
-                dest_node_id=bytes(31),
-                src_node_id=bytes(32),
-                flag=PacketFlag.MESSAGE,
-                nonce=bytes(12),
-                authdata=bytes(32),
-                message=b"",
-                encryption_key=bytes(16),
-            )
-
-    def test_invalid_nonce_length_raises(self):
-        """Test that invalid nonce length raises ValueError."""
-        with pytest.raises(ValueError, match="Nonce must be 12 bytes"):
-            encode_packet(
-                dest_node_id=bytes(32),
-                src_node_id=bytes(32),
-                flag=PacketFlag.MESSAGE,
-                nonce=bytes(11),
-                authdata=bytes(32),
-                message=b"",
-                encryption_key=bytes(16),
-            )
 
 
 class TestConstants:
@@ -287,11 +243,6 @@ class TestConstants:
         assert HANDSHAKE_HEADER_SIZE == 34
 
 
-# ==============================================================================
-# Phase 6: Packet Size Validation Tests
-# ==============================================================================
-
-
 class TestPacketSizeLimits:
     """Packet size boundary validation.
 
@@ -302,23 +253,17 @@ class TestPacketSizeLimits:
 
     def test_min_packet_size_constant(self):
         """MIN_PACKET_SIZE matches spec minimum."""
-        from lean_spec.subspecs.networking.discovery.config import MIN_PACKET_SIZE
-
         # masking-iv (16) + static-header (23) + min authdata (24 for WHOAREYOU)
         assert MIN_PACKET_SIZE == 63
 
     def test_max_packet_size_constant(self):
         """MAX_PACKET_SIZE matches IPv6 MTU."""
-        from lean_spec.subspecs.networking.discovery.config import MAX_PACKET_SIZE
-
         # IPv6 minimum MTU = 1280 bytes
         assert MAX_PACKET_SIZE == 1280
 
     def test_reject_undersized_packet(self):
         """Packets smaller than MIN_PACKET_SIZE are rejected."""
-        from lean_spec.subspecs.networking.discovery.config import MIN_PACKET_SIZE
-
-        local_node_id = bytes(32)
+        local_node_id = NodeId(bytes(32))
 
         # Packet that's too small.
         undersized_packet = bytes(MIN_PACKET_SIZE - 1)
@@ -328,8 +273,6 @@ class TestPacketSizeLimits:
 
     def test_minimum_valid_packet_structure(self):
         """Minimum valid packet has correct structure."""
-        from lean_spec.subspecs.networking.discovery.config import MIN_PACKET_SIZE
-
         # WHOAREYOU is the smallest packet type:
         # masking-iv (16) + static-header (23) + authdata (24) = 63 bytes
         expected_min = 16 + STATIC_HEADER_SIZE + WHOAREYOU_AUTHDATA_SIZE
@@ -337,10 +280,10 @@ class TestPacketSizeLimits:
 
     def test_encode_packet_enforces_max_size(self):
         """encode_packet raises error if packet exceeds max size."""
-        src_id = bytes(32)
-        dest_id = bytes(32)
-        nonce = bytes(12)
-        encryption_key = bytes(16)
+        src_id = NodeId(bytes(32))
+        dest_id = NodeId(bytes(32))
+        nonce = Nonce(bytes(12))
+        encryption_key = Bytes16(bytes(16))
 
         # Create authdata.
         authdata = encode_message_authdata(src_id)
@@ -354,7 +297,6 @@ class TestPacketSizeLimits:
         with pytest.raises(ValueError, match="exceeds max size"):
             encode_packet(
                 dest_node_id=dest_id,
-                src_node_id=src_id,
                 flag=PacketFlag.MESSAGE,
                 nonce=nonce,
                 authdata=authdata,
@@ -364,7 +306,7 @@ class TestPacketSizeLimits:
 
     def test_truncated_static_header_rejected(self):
         """Incomplete static header is rejected."""
-        local_node_id = bytes(32)
+        local_node_id = NodeId(bytes(32))
 
         # Packet with only masking-iv and partial static header.
         # masking-iv (16) + partial static header (10 bytes) = 26 bytes
@@ -375,9 +317,7 @@ class TestPacketSizeLimits:
 
     def test_truncated_authdata_rejected(self):
         """Packet with incomplete authdata is rejected."""
-        from lean_spec.subspecs.networking.discovery.crypto import aes_ctr_encrypt
-
-        local_node_id = bytes(32)
+        local_node_id = NodeId(bytes(32))
         masking_iv = bytes(16)
 
         # Build a valid static header but with claimed authdata larger than packet.
@@ -387,7 +327,7 @@ class TestPacketSizeLimits:
 
         # Encrypt/mask the header.
         masking_key = local_node_id[:16]
-        masked_header = aes_ctr_encrypt(masking_key, masking_iv, static_header)
+        masked_header = aes_ctr_encrypt(Bytes16(masking_key), Bytes16(masking_iv), static_header)
 
         # Create packet: masking-iv + masked-header + only 10 bytes (not 100).
         # This will be rejected because total size < MIN_PACKET_SIZE (63 bytes)
@@ -397,14 +337,46 @@ class TestPacketSizeLimits:
             decode_packet_header(local_node_id, incomplete_packet)
 
 
+class TestEncodePacketEdgeCases:
+    """Edge case tests for packet encoding."""
+
+    def test_message_flag_without_encryption_key_raises(self):
+        """MESSAGE packets require an encryption key."""
+        with pytest.raises(ValueError, match="Encryption key required"):
+            encode_packet(
+                dest_node_id=NodeId(bytes(32)),
+                flag=PacketFlag.MESSAGE,
+                nonce=Nonce(bytes(12)),
+                authdata=encode_message_authdata(NodeId(bytes(32))),
+                message=b"\x01\xc2\x01\x01",
+                encryption_key=None,
+            )
+
+    def test_handshake_flag_without_encryption_key_raises(self):
+        """HANDSHAKE packets require an encryption key."""
+        authdata = encode_handshake_authdata(
+            src_id=NodeId(bytes(32)),
+            id_signature=Bytes64(bytes(64)),
+            eph_pubkey=Bytes33(bytes([0x02]) + bytes(32)),
+        )
+
+        with pytest.raises(ValueError, match="Encryption key required"):
+            encode_packet(
+                dest_node_id=NodeId(bytes(32)),
+                flag=PacketFlag.HANDSHAKE,
+                nonce=Nonce(bytes(12)),
+                authdata=authdata,
+                message=b"\x01\xc2\x01\x01",
+                encryption_key=None,
+            )
+
+
 class TestPacketProtocolValidation:
     """Protocol ID and version validation in packet decoding."""
 
     def test_invalid_protocol_id_rejected(self):
         """Packet with wrong protocol ID is rejected."""
-        from lean_spec.subspecs.networking.discovery.crypto import aes_ctr_encrypt
-
-        local_node_id = bytes(32)
+        local_node_id = NodeId(bytes(32))
         masking_iv = bytes(16)
 
         # Build header with wrong protocol ID but correct structure.
@@ -415,7 +387,7 @@ class TestPacketProtocolValidation:
         # Authdata for WHOAREYOU = 24 bytes.
         full_content = wrong_protocol_header + bytes(24)
         masking_key = local_node_id[:16]
-        masked_content = aes_ctr_encrypt(masking_key, masking_iv, full_content)
+        masked_content = aes_ctr_encrypt(Bytes16(masking_key), Bytes16(masking_iv), full_content)
 
         # Packet = masking-iv + masked-content
         packet = masking_iv + masked_content
@@ -425,9 +397,7 @@ class TestPacketProtocolValidation:
 
     def test_invalid_protocol_version_rejected(self):
         """Packet with unsupported protocol version is rejected."""
-        from lean_spec.subspecs.networking.discovery.crypto import aes_ctr_encrypt
-
-        local_node_id = bytes(32)
+        local_node_id = NodeId(bytes(32))
         masking_iv = bytes(16)
 
         # Build header with wrong version (0x0099 instead of 0x0001).
@@ -436,7 +406,7 @@ class TestPacketProtocolValidation:
         # Full masked content.
         full_content = wrong_version_header + bytes(24)
         masking_key = local_node_id[:16]
-        masked_content = aes_ctr_encrypt(masking_key, masking_iv, full_content)
+        masked_content = aes_ctr_encrypt(Bytes16(masking_key), Bytes16(masking_iv), full_content)
 
         packet = masking_iv + masked_content
 

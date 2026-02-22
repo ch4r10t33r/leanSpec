@@ -5,7 +5,7 @@ Run a minimal lean consensus client that can sync with other lean consensus node
 
 Usage::
 
-    python -m lean_spec --genesis config.yaml --bootnode /ip4/127.0.0.1/tcp/9000
+    python -m lean_spec --genesis config.yaml --bootnode /ip4/127.0.0.1/udp/9000/quic-v1
     python -m lean_spec --genesis config.yaml --bootnode enr:-IS4QHCYrYZbAKW...
     python -m lean_spec --genesis config.yaml --checkpoint-sync-url http://localhost:5052
     python -m lean_spec --genesis config.yaml --validator-keys ./keys --node-id lean_spec_0
@@ -14,7 +14,7 @@ Usage::
 Options:
     --genesis              Path to genesis YAML file (required)
     --bootnode             Bootnode address (multiaddr or ENR string, can be repeated)
-    --listen               Address to listen on (default: /ip4/0.0.0.0/tcp/9001)
+    --listen               Address to listen on (default: /ip4/0.0.0.0/udp/9001/quic-v1)
     --checkpoint-sync-url  URL to fetch finalized checkpoint state for fast sync
     --validator-keys       Path to validator keys directory
     --node-id              Node identifier for validator assignment (default: lean_spec_0)
@@ -26,19 +26,29 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import sys
+import time
 from pathlib import Path
+from typing import Final
 
 from lean_spec.subspecs.chain.config import ATTESTATION_COMMITTEE_COUNT
 from lean_spec.subspecs.containers import Block, BlockBody, Checkpoint, State
 from lean_spec.subspecs.containers.block.types import AggregatedAttestations
 from lean_spec.subspecs.containers.slot import Slot
-from lean_spec.subspecs.forkchoice import Store
+from lean_spec.subspecs.containers.validator import SubnetId
 from lean_spec.subspecs.genesis import GenesisConfig
 from lean_spec.subspecs.networking.client import LiveNetworkEventSource
+from lean_spec.subspecs.networking.enr import ENR
 from lean_spec.subspecs.networking.gossipsub import GossipTopic
 from lean_spec.subspecs.networking.reqresp.message import Status
-from lean_spec.subspecs.node import Node, NodeConfig, get_local_validator_id
+from lean_spec.subspecs.node import Node, NodeConfig
 from lean_spec.subspecs.ssz.hash import hash_tree_root
+from lean_spec.subspecs.sync.checkpoint_sync import (
+    CheckpointSyncError,
+    fetch_finalized_state,
+    verify_checkpoint_state,
+)
 from lean_spec.subspecs.validator import ValidatorRegistry
 from lean_spec.types import Bytes32, Uint64
 
@@ -46,21 +56,9 @@ from lean_spec.types import Bytes32, Uint64
 #
 # Must match the fork string used by ream and other clients.
 # For devnet, this is "devnet0".
-GOSSIP_FORK_DIGEST = "devnet0"
+GOSSIP_FORK_DIGEST: Final = "devnet0"
 
 logger = logging.getLogger(__name__)
-
-
-def is_enr_string(bootnode: str) -> bool:
-    """
-    Check if bootnode string is an ENR (vs multiaddr).
-
-    Uses prefix detection rather than attempting full parsing.
-    This is both faster and avoids import overhead for simple checks.
-
-    Per EIP-778, all ENR strings begin with "enr:" followed by base64url content.
-    """
-    return bootnode.startswith("enr:")
 
 
 def resolve_bootnode(bootnode: str) -> str:
@@ -74,17 +72,15 @@ def resolve_bootnode(bootnode: str) -> str:
     - libp2p tools: Usually provide multiaddrs directly
 
     Args:
-        bootnode: Either an ENR string (enr:-IS4Q...) or multiaddr (/ip4/.../tcp/...).
+        bootnode: Either an ENR string (enr:-IS4Q...) or multiaddr (/ip4/.../udp/.../quic-v1).
 
     Returns:
         Multiaddr string suitable for dialing.
 
     Raises:
-        ValueError: If ENR is malformed or has no TCP connection info.
+        ValueError: If ENR is malformed or has no UDP connection info.
     """
-    if is_enr_string(bootnode):
-        from lean_spec.subspecs.networking.enr import ENR
-
+    if bootnode.startswith("enr:"):
         enr = ENR.from_string(bootnode)
 
         # Verify structural validity (correct scheme, public key present).
@@ -238,12 +234,6 @@ async def _init_from_checkpoint(
     Returns:
         A fully initialized Node if successful, None if checkpoint sync failed.
     """
-    from lean_spec.subspecs.sync.checkpoint_sync import (
-        CheckpointSyncError,
-        fetch_finalized_state,
-        verify_checkpoint_state,
-    )
-
     try:
         logger.info("Fetching checkpoint state from %s", checkpoint_sync_url)
         state = await fetch_finalized_state(checkpoint_sync_url, State)
@@ -252,7 +242,7 @@ async def _init_from_checkpoint(
         #
         # This is defense in depth. We trust the source, but still verify
         # basic invariants before using the state.
-        if not await verify_checkpoint_state(state):
+        if not verify_checkpoint_state(state):
             logger.error("Checkpoint state verification failed")
             return None
 
@@ -280,8 +270,8 @@ async def _init_from_checkpoint(
         #
         # The store treats this as the new "genesis" for fork choice purposes.
         # All blocks before the checkpoint are effectively pruned.
-        validator_id = get_local_validator_id(validator_registry)
-        store = Store.get_forkchoice_store(state, anchor_block, validator_id)
+        validator_id = validator_registry.primary_index() if validator_registry else None
+        store = state.to_forkchoice_store(anchor_block, validator_id)
         logger.info(
             "Initialized from checkpoint at slot %d (finalized=%s)",
             state.slot,
@@ -413,8 +403,6 @@ async def run_node(
         genesis_time_now: Override genesis time to current time for testing.
         is_aggregator: Enable aggregator mode for attestation aggregation.
     """
-    import time
-
     logger.info("Loading genesis from %s", genesis_path)
     genesis = GenesisConfig.from_yaml_file(genesis_path)
 
@@ -480,6 +468,12 @@ async def run_node(
 
     event_source = await LiveNetworkEventSource.create()
 
+    # Set the fork digest for incoming message validation.
+    #
+    # Without this, the event source defaults to "0x00000000" and rejects
+    # all messages from other clients that use "devnet0".
+    event_source.set_fork_digest(GOSSIP_FORK_DIGEST)
+
     # Subscribe to gossip topics.
     #
     # We subscribe before connecting to bootnodes so that when
@@ -488,9 +482,9 @@ async def run_node(
     block_topic = str(GossipTopic.block(GOSSIP_FORK_DIGEST))
     event_source.subscribe_gossip_topic(block_topic)
     # Subscribe to attestation subnet topics based on local validator id.
-    validator_id = get_local_validator_id(validator_registry)
+    validator_id = validator_registry.primary_index() if validator_registry else None
     if validator_id is None:
-        subnet_id = 0
+        subnet_id = SubnetId(0)
         logger.info("No local validator id; subscribing to attestation subnet %d", subnet_id)
     else:
         subnet_id = validator_id.compute_subnet_id(ATTESTATION_COMMITTEE_COUNT)
@@ -623,8 +617,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--listen",
-        default="/ip4/0.0.0.0/tcp/9001",
-        help="Address to listen on (default: /ip4/0.0.0.0/tcp/9001)",
+        default="/ip4/0.0.0.0/udp/9001/quic-v1",
+        help="Address to listen on (default: /ip4/0.0.0.0/udp/9001/quic-v1)",
     )
     parser.add_argument(
         "--checkpoint-sync-url",
@@ -675,14 +669,14 @@ def main() -> None:
     try:
         asyncio.run(
             run_node(
-                args.genesis,
-                args.bootnodes,
-                args.listen,
-                args.checkpoint_sync_url,
-                args.validator_keys,
-                args.node_id,
-                args.genesis_time_now,
-                args.is_aggregator,
+                genesis_path=args.genesis,
+                bootnodes=args.bootnodes,
+                listen_addr=args.listen,
+                checkpoint_sync_url=args.checkpoint_sync_url,
+                validator_keys_path=args.validator_keys,
+                node_id=args.node_id,
+                genesis_time_now=args.genesis_time_now,
+                is_aggregator=args.is_aggregator,
             )
         )
     except KeyboardInterrupt:
@@ -691,9 +685,6 @@ def main() -> None:
     finally:
         # Force exit to ensure all threads/sockets are released.
         # This is important for QUIC which may have background threads.
-        import os
-        import sys
-
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

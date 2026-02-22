@@ -1,19 +1,18 @@
 """
 Chain service that drives consensus timing.
 
-The Chain Problem
------------------
-Ethereum consensus runs on a clock. Every 4 seconds (1 slot), validators:
-- Interval 0: Propose blocks
-- Interval 1: Create attestations
-- Interval 2: Update safe target
-- Interval 3: Accept attestations into fork choice
+Ethereum consensus runs on a clock. Every 4 seconds (1 slot), validators act
+at each of the 5 intervals:
+
+- Interval 0: Block proposal
+- Interval 1: Vote propagation
+- Interval 2: Aggregation
+- Interval 3: Safe target update
+- Interval 4: Attestation acceptance into fork choice
 
 The Store has all this logic built in. But nothing drives the clock.
-ChainService is that driver - a simple timer loop.
+ChainService is that driver — a simple timer loop:
 
-How It Works
-------------
 1. Sleep until next interval boundary
 2. Get current wall-clock time
 3. Tick the store forward to current time
@@ -27,7 +26,12 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+from lean_spec.subspecs.chain.config import INTERVALS_PER_SLOT
+from lean_spec.subspecs.containers.attestation.attestation import (
+    SignedAggregatedAttestation,
+)
 from lean_spec.subspecs.sync import SyncService
+from lean_spec.types import Uint64
 
 from .clock import Interval, SlotClock
 
@@ -100,7 +104,7 @@ class ChainService:
                 and total_interval <= last_handled_total_interval
             )
             if already_handled:
-                await self._sleep_until_next_interval()
+                await self.clock.sleep_until_next_interval()
                 # Check if stopped during sleep.
                 if not self._running:
                     break
@@ -112,42 +116,78 @@ class ChainService:
                 if total_interval <= last_handled_total_interval:
                     continue
 
-            # Get current wall-clock time as Unix timestamp (may have changed after sleep).
-            #
-            # The store expects an absolute timestamp, not intervals.
-            # It internally converts to intervals.
-            current_time = self.clock.current_time()
-
-            # Tick the store forward to current time.
+            # Tick the store forward to current interval.
             #
             # The store advances time interval by interval, performing
             # appropriate actions at each interval.
             #
             # This minimal service does not produce blocks.
             # Block production requires validator keys.
-            new_store = self.sync_service.store.on_tick(
-                time=current_time,
-                has_proposal=False,
-            )
+            new_aggregated_attestations = await self._tick_to(total_interval)
 
-            # Update sync service's store reference.
-            #
-            # SyncService owns the authoritative store. After ticking,
-            # we update its reference so gossip block processing sees
-            # the updated time.
-            self.sync_service.store = new_store
+            # Publish any new aggregated attestations produced this tick.
+            if new_aggregated_attestations:
+                for agg in new_aggregated_attestations:
+                    await self.sync_service.publish_aggregated_attestation(agg)
 
             logger.info(
-                "Tick: slot=%d interval=%d time=%d head=%s finalized=slot%d",
+                "Tick: slot=%d interval=%d head=%s finalized=slot%d",
                 self.clock.current_slot(),
-                self.clock.total_intervals(),
-                current_time,
-                new_store.head.hex(),
-                new_store.latest_finalized.slot,
+                total_interval,
+                self.sync_service.store.head.hex(),
+                self.sync_service.store.latest_finalized.slot,
             )
 
             # Mark this interval as handled.
             last_handled_total_interval = total_interval
+
+    async def _tick_to(self, target_interval: Interval) -> list[SignedAggregatedAttestation]:
+        """
+        Advance store to target interval with skip and yield.
+
+        When the node falls behind by more than one slot, stale intervals
+        are skipped. Processing every missed interval synchronously would
+        block the event loop, starving gossip and causing the node to fall
+        further behind.
+
+        Between each remaining interval tick, yields to the event loop so
+        gossip messages can be processed.
+
+        Updates the sync service's store after each tick so concurrent
+        gossip handlers see current time.
+
+        Returns aggregated attestations produced during the ticks.
+        """
+        store = self.sync_service.store
+        all_new_aggregates: list[SignedAggregatedAttestation] = []
+
+        # Skip stale intervals when falling behind.
+        #
+        # Jump to the last full slot boundary before the target.
+        # The final slot's worth of intervals still runs normally so that
+        # aggregation, safe target, and attestation acceptance happen.
+        gap = target_interval - store.time
+        if gap > INTERVALS_PER_SLOT:
+            skip_to = Uint64(target_interval - INTERVALS_PER_SLOT)
+            store = store.model_copy(update={"time": skip_to})
+            self.sync_service.store = store
+
+        # Tick remaining intervals one at a time.
+        while store.time < target_interval:
+            store, new_aggregates = store.tick_interval(
+                has_proposal=False,
+                is_aggregator=self.sync_service.is_aggregator,
+            )
+            all_new_aggregates.extend(new_aggregates)
+            self.sync_service.store = store
+
+            # Yield to the event loop so gossip handlers can run.
+            # Re-read store afterward: a gossip handler may have added
+            # blocks or attestations during the yield.
+            await asyncio.sleep(0)
+            store = self.sync_service.store
+
+        return all_new_aggregates
 
     async def _initial_tick(self) -> Interval | None:
         """
@@ -162,25 +202,17 @@ class ChainService:
 
         # Only tick if we're past genesis.
         if current_time >= self.clock.genesis_time:
-            new_store = self.sync_service.store.on_tick(
-                time=current_time,
-                has_proposal=False,
-            )
-            self.sync_service.store = new_store
-            return self.clock.total_intervals()
+            target_interval = self.clock.total_intervals()
+
+            # Use _tick_to for skip + yield during catch-up.
+            # Discard aggregated attestations from catch-up.
+            # During initial sync we may be many slots behind.
+            # Publishing stale aggregations would spam the network.
+            await self._tick_to(target_interval)
+
+            return target_interval
 
         return None
-
-    async def _sleep_until_next_interval(self) -> None:
-        """
-        Sleep until the next interval boundary.
-
-        Uses the clock to calculate precise sleep duration, ensuring tick
-        timing is aligned with network consensus expectations.
-        """
-        sleep_time = self.clock.seconds_until_next_interval()
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
 
     def stop(self) -> None:
         """

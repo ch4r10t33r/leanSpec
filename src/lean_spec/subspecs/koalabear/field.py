@@ -1,33 +1,32 @@
 """Core definition of the KoalaBear prime field Fp."""
 
-from typing import IO, Self
+from __future__ import annotations
+
+from typing import IO, Final, Self
 
 from lean_spec.types import SSZType
 
-# =================================================================
-# Field Constants
-#
-# The prime is chosen because the cube map (x -> x^3) is an
-# automorphism of the multiplicative group.
-# =================================================================
+P: Final = 2**31 - 2**24 + 1
+"""
+The KoalaBear Prime: P = 2^31 - 2^24 + 1
 
-P: int = 2**31 - 2**24 + 1
-"""The KoalaBear Prime: P = 2^31 - 2^24 + 1"""
+The prime is chosen because the cube map (x -> x^3) is an automorphism of the multiplicative group.
+"""
 
-P_BITS: int = 31
+P_BITS: Final = 31
 """The number of bits in the prime P."""
 
-P_BYTES: int = (P_BITS + 7) // 8
+P_BYTES: Final = (P_BITS + 7) // 8
 """The size of a KoalaBear field element in bytes."""
 
-TWO_ADICITY: int = 24
+TWO_ADICITY: Final = 24
 """
 The largest integer n such that 2^n divides (P - 1).
 
 P - 1 = 2^24 * 127
 """
 
-TWO_ADIC_GENERATORS: list[int] = [
+TWO_ADIC_GENERATORS: Final[list[int]] = [
     0x1,
     0x7F000000,
     0x7E010002,
@@ -62,14 +61,6 @@ the multiplicative subgroup of order 2^n.
 """
 
 
-# =================================================================
-# Base Field Fp
-#
-# This class implements the finite field F_p where p is the KoalaBear prime.
-# All arithmetic is performed modulo P.
-# =================================================================
-
-
 class Fp(SSZType):
     """
     An element in the KoalaBear prime field F_p.
@@ -91,7 +82,7 @@ class Fp(SSZType):
         Raises:
             TypeError: If value is not an integer.
         """
-        if not isinstance(value, int):
+        if not isinstance(value, int) or isinstance(value, bool):
             raise TypeError(f"Field value must be an integer, got {type(value).__name__}")
 
         # Normalize to [0, P) - handles negative values correctly
@@ -109,9 +100,8 @@ class Fp(SSZType):
 
     def serialize(self, stream: IO[bytes]) -> int:
         """Serialize the field element to a binary stream."""
-        data = self.value.to_bytes(P_BYTES, byteorder="little")
-        stream.write(data)
-        return len(data)
+        stream.write(self.value.to_bytes(P_BYTES, byteorder="little"))
+        return P_BYTES
 
     @classmethod
     def deserialize(cls, stream: IO[bytes], scope: int) -> Self:
@@ -202,59 +192,3 @@ class Fp(SSZType):
             4-byte little-endian representation of the field element.
         """
         return self.encode_bytes()
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> Self:
-        """
-        Deserialize a field element from bytes.
-
-        This is the inverse of `__bytes__()` and follows Python's standard
-        deserialization pattern.
-
-        Args:
-            data: 4-byte little-endian representation of a field element.
-
-        Returns:
-            Deserialized field element.
-
-        Raises:
-            ValueError: If data has incorrect length or represents an invalid field value.
-        """
-        return cls.decode_bytes(data)
-
-    @classmethod
-    def serialize_list(cls, elements: list[Self]) -> bytes:
-        """
-        Serialize a list of field elements to bytes.
-
-        This is a convenience method for serializing multiple field elements
-        at once, useful for container serialization.
-
-        Args:
-            elements: List of field elements to serialize.
-
-        Returns:
-            Concatenated bytes of all field elements.
-        """
-        return b"".join(bytes(elem) for elem in elements)
-
-    @classmethod
-    def deserialize_list(cls, data: bytes, count: int) -> list[Self]:
-        """
-        Deserialize a fixed number of field elements from bytes.
-
-        Args:
-            data: Raw bytes to deserialize.
-            count: Expected number of field elements.
-
-        Returns:
-            List of deserialized field elements.
-
-        Raises:
-            ValueError: If data length doesn't match expected count.
-        """
-        expected_len = count * P_BYTES
-        if len(data) != expected_len:
-            raise ValueError(f"Expected {expected_len} bytes for {count} elements, got {len(data)}")
-
-        return [cls.from_bytes(data[i : i + P_BYTES]) for i in range(0, len(data), P_BYTES)]

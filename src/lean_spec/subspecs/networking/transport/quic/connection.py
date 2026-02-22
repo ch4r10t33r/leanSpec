@@ -2,7 +2,7 @@
 QUIC connection implementation for libp2p.
 
 QUIC provides native encryption (TLS 1.3) and multiplexing, eliminating the need
-for Noise and yamux layers that TCP requires. This results in fewer round-trips
+for Noise and yamux layers. This results in fewer round-trips
 and simpler connection establishment.
 
 Connection flow:
@@ -11,7 +11,7 @@ Connection flow:
     3. Ready for streams (QUIC native multiplexing)
 
 Each stream uses multistream-select to negotiate application protocols,
-same as TCP connections.
+same as any libp2p connection.
 
 References:
     - aioquic documentation: https://aioquic.readthedocs.io/
@@ -21,12 +21,12 @@ References:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ssl
 import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from aioquic.asyncio import QuicConnectionProtocol
 from aioquic.asyncio import connect as quic_connect
@@ -40,12 +40,10 @@ from aioquic.quic.events import (
     StreamReset,
 )
 
-from ..multistream import negotiate_lazy_client
+from ..identity import IdentityKeypair
 from ..peer_id import PeerId
+from .stream_adapter import QuicStreamAdapter
 from .tls import generate_libp2p_certificate
-
-if TYPE_CHECKING:
-    from ..identity import IdentityKeypair
 
 
 class QuicTransportError(Exception):
@@ -57,9 +55,9 @@ class QuicStream:
     """
     A single QUIC stream for application data.
 
-    QUIC streams are lighter than TCP connections - opening a stream is just
-    sending a frame, no handshake required. Flow control is per-stream,
-    preventing head-of-line blocking.
+    QUIC streams are lightweight - opening a stream is just sending a frame,
+    no handshake required. Flow control is per-stream, preventing
+    head-of-line blocking.
     """
 
     _protocol: QuicConnectionProtocol
@@ -178,7 +176,7 @@ class QuicConnection:
     A QUIC connection to a peer.
 
     Wraps aioquic's protocol and provides the Connection interface.
-    Unlike TCP connections, no Noise or yamux layers are needed.
+    No Noise or yamux layers are needed; QUIC handles encryption and multiplexing natively.
     """
 
     _protocol: QuicConnectionProtocol
@@ -224,12 +222,8 @@ class QuicConnection:
         self._streams[stream_id] = stream
 
         # Negotiate the application protocol.
-        wrapper = _QuicStreamWrapper(stream)
-        negotiated = await negotiate_lazy_client(
-            wrapper.reader,
-            wrapper.writer,
-            protocol,
-        )
+        adapter = QuicStreamAdapter(stream)
+        negotiated = await adapter.negotiate_lazy_client(protocol)
         stream._protocol_id = negotiated
 
         # Yield to allow aioquic to process any pending events.
@@ -358,7 +352,7 @@ def is_quic_multiaddr(multiaddr: str) -> bool:
         multiaddr: Address string to check.
 
     Returns:
-        True if the multiaddr uses QUIC, False for TCP.
+        True if the multiaddr uses QUIC, False otherwise.
     """
     parts = multiaddr.lower().split("/")
     return "quic" in parts or "quic-v1" in parts
@@ -373,23 +367,19 @@ def parse_multiaddr(multiaddr: str) -> tuple[str, int, str | None, PeerId | None
 
     Returns:
         (host, port, transport, peer_id) tuple.
-        transport is "quic" or "tcp", peer_id may be None.
+        transport is "quic", peer_id may be None.
     """
     parts = multiaddr.strip("/").split("/")
 
     host = None
     port = None
-    transport = "tcp"  # Default
+    transport = "quic"  # Default
     peer_id = None
 
     i = 0
     while i < len(parts):
         if parts[i] == "ip4" and i + 1 < len(parts):
             host = parts[i + 1]
-            i += 2
-        elif parts[i] == "tcp" and i + 1 < len(parts):
-            port = int(parts[i + 1])
-            transport = "tcp"
             i += 2
         elif parts[i] == "udp" and i + 1 < len(parts):
             port = int(parts[i + 1])
@@ -416,7 +406,7 @@ class QuicConnectionManager:
     """
     Manages QUIC connections with libp2p-tls authentication.
 
-    Unlike TCP's ConnectionManager, no Noise or yamux layers are needed.
+    No Noise or yamux layers are needed.
     QUIC provides encryption and multiplexing natively.
 
     Usage:
@@ -430,7 +420,9 @@ class QuicConnectionManager:
     _config: QuicConfiguration
     _connections: dict[PeerId, QuicConnection] = field(default_factory=dict)
     _temp_dir: Path | None = None
-    _context_managers: list = field(default_factory=list)
+    _context_managers: list[contextlib.AbstractAsyncContextManager[object]] = field(
+        default_factory=list
+    )
 
     @classmethod
     async def create(
@@ -532,8 +524,6 @@ class QuicConnectionManager:
             else:
                 # Generate a random peer ID for now.
                 # This is NOT correct for production but allows testing.
-                from ..identity import IdentityKeypair
-
                 temp_key = IdentityKeypair.generate()
                 peer_id = temp_key.to_peer_id()
 
@@ -594,8 +584,6 @@ class QuicConnectionManager:
         # Callback to set up connection when handshake completes.
         # Captures this manager's state (self, on_connection, host, port).
         def handle_handshake(protocol_instance: LibP2PQuicProtocol) -> None:
-            from ..identity import IdentityKeypair
-
             temp_key = IdentityKeypair.generate()
             remote_peer_id = temp_key.to_peer_id()
 
@@ -628,74 +616,3 @@ class QuicConnectionManager:
         )
         # Keep running until shutdown is requested.
         await shutdown_event.wait()
-
-
-# =============================================================================
-# Stream Wrapper for multistream-select
-# =============================================================================
-
-
-class _QuicStreamWrapper:
-    """Wrapper to use QuicStream with multistream negotiation."""
-
-    __slots__ = ("_stream", "_buffer", "reader", "writer")
-
-    def __init__(self, stream: QuicStream) -> None:
-        self._stream = stream
-        self._buffer = b""
-        self.reader = _QuicStreamReader(self)
-        self.writer = _QuicStreamWriter(self)
-
-
-class _QuicStreamReader:
-    """Fake StreamReader that reads from QuicStream."""
-
-    __slots__ = ("_wrapper",)
-
-    def __init__(self, wrapper: _QuicStreamWrapper) -> None:
-        self._wrapper = wrapper
-
-    async def read(self, n: int) -> bytes:
-        """Read up to n bytes."""
-        if not self._wrapper._buffer:
-            self._wrapper._buffer = await self._wrapper._stream.read()
-
-        result = self._wrapper._buffer[:n]
-        self._wrapper._buffer = self._wrapper._buffer[n:]
-        return result
-
-    async def readexactly(self, n: int) -> bytes:
-        """Read exactly n bytes."""
-        result = b""
-        while len(result) < n:
-            chunk = await self.read(n - len(result))
-            if not chunk:
-                raise asyncio.IncompleteReadError(result, n)
-            result += chunk
-        return result
-
-
-class _QuicStreamWriter:
-    """Fake StreamWriter that writes to QuicStream."""
-
-    __slots__ = ("_wrapper", "_pending")
-
-    def __init__(self, wrapper: _QuicStreamWrapper) -> None:
-        self._wrapper = wrapper
-        self._pending = b""
-
-    def write(self, data: bytes) -> None:
-        """Buffer data for writing."""
-        self._pending += data
-
-    async def drain(self) -> None:
-        """Flush pending data."""
-        if self._pending:
-            await self._wrapper._stream.write(self._pending)
-            self._pending = b""
-
-    def close(self) -> None:
-        """No-op."""
-
-    async def wait_closed(self) -> None:
-        """No-op."""

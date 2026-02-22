@@ -17,7 +17,7 @@ Topics follow a structured format::
 
     /{prefix}/{fork_digest}/{topic_name}/{encoding}
 
-    Example: /leanconsensus/0x12345678/block/ssz_snappy
+    Example: /leanconsensus/0x12345678/blocks/ssz_snappy
 
 **Components:**
 
@@ -28,7 +28,7 @@ Topics follow a structured format::
 +----------------+----------------------------------------------------------+
 | fork_digest    | 4-byte fork identifier as hex (`0x12345678`)           |
 +----------------+----------------------------------------------------------+
-| topic_name     | Message type (`block`, `attestation`)                |
+| topic_name     | Message type (`blocks`, `attestation`)               |
 +----------------+----------------------------------------------------------+
 | encoding       | Serialization format (always `ssz_snappy`)             |
 +----------------+----------------------------------------------------------+
@@ -46,20 +46,23 @@ Topic Types
 +----------------+----------------------------------------------------------+
 | Topic          | Content                                                  |
 +================+==========================================================+
-| block          | Signed beacon blocks                                     |
+| blocks         | Signed beacon blocks                                     |
 +----------------+----------------------------------------------------------+
 | attestation    | Signed attestations                                      |
 +----------------+----------------------------------------------------------+
 
 References:
 ----------
-- Ethereum P2P: https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md
+- Ethereum P2P: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Final
+
+from lean_spec.subspecs.containers.validator import SubnetId
 
 
 class ForkMismatchError(ValueError):
@@ -72,34 +75,34 @@ class ForkMismatchError(ValueError):
         super().__init__(f"Fork mismatch: expected {expected}, got {actual}")
 
 
-TOPIC_PREFIX: str = "leanconsensus"
+TOPIC_PREFIX: Final = "leanconsensus"
 """Network prefix for Lean consensus gossip topics.
 
 Identifies this network in topic strings. Different networks
 (mainnet, testnets) may use different prefixes.
 """
 
-ENCODING_POSTFIX: str = "ssz_snappy"
+ENCODING_POSTFIX: Final = "ssz_snappy"
 """Encoding suffix for SSZ with Snappy compression.
 
 All Ethereum consensus gossip messages use SSZ serialization
 with Snappy compression.
 """
 
-BLOCK_TOPIC_NAME: str = "block"
+BLOCK_TOPIC_NAME: Final = "blocks"
 """Topic name for block messages.
 
 Used in the topic string to identify signed beacon block messages.
 """
 
 
-ATTESTATION_SUBNET_TOPIC_PREFIX: str = "attestation"
+ATTESTATION_SUBNET_TOPIC_PREFIX: Final = "attestation"
 """Base prefix for attestation subnet topic names.
 
 Full topic names are formatted as "attestation_{subnet_id}".
 """
 
-AGGREGATED_ATTESTATION_TOPIC_NAME: str = "aggregation"
+AGGREGATED_ATTESTATION_TOPIC_NAME: Final = "aggregation"
 """Topic name for committee aggregation messages.
 
 Used in the topic string to identify committee's aggregation messages.
@@ -151,7 +154,7 @@ class GossipTopic:
     Peers must match on fork digest to exchange messages on a topic.
     """
 
-    subnet_id: int | None = None
+    subnet_id: SubnetId | None = None
     """Subnet id for attestation subnet topics (required for ATTESTATION_SUBNET)."""
 
     def __str__(self) -> str:
@@ -168,14 +171,6 @@ class GossipTopic:
             topic_name = str(self.kind)
         return f"/{TOPIC_PREFIX}/{self.fork_digest}/{topic_name}/{ENCODING_POSTFIX}"
 
-    def __bytes__(self) -> bytes:
-        """Return the topic string as UTF-8 bytes.
-
-        Returns:
-            Topic string encoded as bytes.
-        """
-        return str(self).encode("utf-8")
-
     def validate_fork(self, expected_fork_digest: str) -> None:
         """
         Validate that the topic's fork_digest matches expected.
@@ -188,18 +183,6 @@ class GossipTopic:
         """
         if self.fork_digest != expected_fork_digest:
             raise ForkMismatchError(expected_fork_digest, self.fork_digest)
-
-    def is_fork_compatible(self, expected_fork_digest: str) -> bool:
-        """
-        Check if this topic is compatible with the expected fork.
-
-        Args:
-            expected_fork_digest: Expected fork digest (0x-prefixed hex).
-
-        Returns:
-            True if fork_digest matches, False otherwise.
-        """
-        return self.fork_digest == expected_fork_digest
 
     @classmethod
     def from_string(cls, topic_str: str) -> GossipTopic:
@@ -214,12 +197,7 @@ class GossipTopic:
         Raises:
             ValueError: If the topic string is malformed.
         """
-        parts = topic_str.lstrip("/").split("/")
-
-        if len(parts) != 4:
-            raise ValueError(f"Invalid topic format: expected 4 parts, got {len(parts)}")
-
-        prefix, fork_digest, topic_name, encoding = parts
+        prefix, fork_digest, topic_name, encoding = parse_topic_string(topic_str)
 
         if prefix != TOPIC_PREFIX:
             raise ValueError(f"Invalid prefix: expected '{TOPIC_PREFIX}', got '{prefix}'")
@@ -232,7 +210,7 @@ class GossipTopic:
             try:
                 # Validate the subnet ID is a valid integer
                 subnet_part = topic_name[len("attestation_") :]
-                subnet_id = int(subnet_part)
+                subnet_id = SubnetId(int(subnet_part))
                 return cls(
                     kind=TopicKind.ATTESTATION_SUBNET,
                     fork_digest=fork_digest,
@@ -295,7 +273,7 @@ class GossipTopic:
         return cls(kind=TopicKind.AGGREGATED_ATTESTATION, fork_digest=fork_digest)
 
     @classmethod
-    def attestation_subnet(cls, fork_digest: str, subnet_id: int) -> GossipTopic:
+    def attestation_subnet(cls, fork_digest: str, subnet_id: SubnetId) -> GossipTopic:
         """Create an attestation subnet topic for the given fork and subnet.
 
         Args:
@@ -308,34 +286,11 @@ class GossipTopic:
         return cls(kind=TopicKind.ATTESTATION_SUBNET, fork_digest=fork_digest, subnet_id=subnet_id)
 
 
-def format_topic_string(
-    topic_name: str,
-    fork_digest: str,
-    prefix: str = TOPIC_PREFIX,
-    encoding: str = ENCODING_POSTFIX,
-) -> str:
-    """Format a complete gossip topic string.
-
-    Low-level function for constructing topic strings. For most cases,
-    use `GossipTopic` instead.
-
-    Args:
-        topic_name: Message type (e.g., "block", "attestation").
-        fork_digest: Fork digest as 0x-prefixed hex string.
-        prefix: Network prefix (defaults to TOPIC_PREFIX).
-        encoding: Encoding suffix (defaults to ENCODING_POSTFIX).
-
-    Returns:
-        Formatted topic string.
-    """
-    return f"/{prefix}/{fork_digest}/{topic_name}/{encoding}"
-
-
 def parse_topic_string(topic_str: str) -> tuple[str, str, str, str]:
     """Parse a topic string into its components.
 
-    Low-level function for deconstructing topic strings. For most cases,
-    use ``GossipTopic.from_string()`` instead.
+    Low-level function for deconstructing topic strings.
+    Prefer the dataclass parser for most use cases.
 
     Args:
         topic_str: Topic string to parse.

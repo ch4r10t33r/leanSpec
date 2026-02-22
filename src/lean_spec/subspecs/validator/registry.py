@@ -37,7 +37,7 @@ from lean_spec.subspecs.xmss import SecretKey
 
 logger = logging.getLogger(__name__)
 
-NodeValidatorMapping = dict[str, list[int]]
+type NodeValidatorMapping = dict[str, list[int]]
 """Mapping from node identifier to list of validator indices."""
 
 
@@ -181,16 +181,8 @@ class ValidatorRegistry:
         """
         return self._validators.get(index)
 
-    def has(self, index: ValidatorIndex) -> bool:
-        """
-        Check if we control this validator.
-
-        Args:
-            index: Validator index to check.
-
-        Returns:
-            True if we have keys for this validator.
-        """
+    def __contains__(self, index: ValidatorIndex) -> bool:
+        """Check if we control this validator."""
         return index in self._validators
 
     def indices(self) -> ValidatorIndices:
@@ -201,6 +193,21 @@ class ValidatorRegistry:
             ValidatorIndices collection.
         """
         return ValidatorIndices(data=list(self._validators.keys()))
+
+    def primary_index(self) -> ValidatorIndex | None:
+        """
+        Get the primary validator index for store-level identity.
+
+        Returns the first validator index in the registry.
+        With ATTESTATION_COMMITTEE_COUNT = 1, all validators share subnet 0,
+        so a single ID suffices for store-level operations.
+
+        Returns:
+            First validator index, or None if registry is empty.
+        """
+        if not self._validators:
+            return None
+        return next(iter(self._validators))
 
     def __len__(self) -> int:
         """Number of validators in the registry."""
@@ -282,7 +289,7 @@ class ValidatorRegistry:
         return registry
 
     @classmethod
-    def from_secret_keys(cls, keys: dict[int, SecretKey]) -> ValidatorRegistry:
+    def from_secret_keys(cls, keys: dict[ValidatorIndex, SecretKey]) -> ValidatorRegistry:
         """
         Create registry from a dictionary of secret keys.
 
@@ -296,5 +303,5 @@ class ValidatorRegistry:
         """
         registry = cls()
         for index, secret_key in keys.items():
-            registry.add(ValidatorEntry(index=ValidatorIndex(index), secret_key=secret_key))
+            registry.add(ValidatorEntry(index=index, secret_key=secret_key))
         return registry

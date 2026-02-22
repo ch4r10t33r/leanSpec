@@ -2,61 +2,73 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Coroutine
-from typing import TypeVar
-
 from lean_spec.subspecs.containers.validator import ValidatorIndex
 
 from .builders import (
+    GenesisData,
+    create_mock_sync_service,
     make_aggregated_attestation,
+    make_aggregated_proof,
+    make_attestation_data,
+    make_attestation_data_simple,
     make_block,
     make_bytes32,
+    make_challenge_data,
+    make_checkpoint,
+    make_empty_block_body,
     make_genesis_block,
+    make_genesis_data,
     make_genesis_state,
+    make_keyed_genesis_state,
     make_mock_signature,
-    make_public_key_bytes,
-    make_signature,
     make_signed_attestation,
     make_signed_block,
+    make_signed_block_from_store,
+    make_store,
+    make_store_with_attestation_data,
+    make_store_with_gossip_signatures,
     make_test_block,
     make_test_status,
     make_validators,
-    make_validators_with_keys,
+    make_validators_from_key_manager,
 )
-from .mocks import MockNoiseSession
+from .mocks import MockEventSource, MockForkchoiceStore, MockNetworkRequester
 
 TEST_VALIDATOR_ID = ValidatorIndex(0)
 
 
-_T = TypeVar("_T")
-
-
-def run_async(coro: Coroutine[object, object, _T]) -> _T:
-    """Run an async coroutine synchronously."""
-    return asyncio.run(coro)
-
-
 __all__ = [
     # Builders
+    "GenesisData",
+    "create_mock_sync_service",
     "make_aggregated_attestation",
+    "make_aggregated_proof",
+    "make_attestation_data",
+    "make_attestation_data_simple",
     "make_block",
     "make_bytes32",
+    "make_challenge_data",
+    "make_checkpoint",
+    "make_empty_block_body",
     "make_genesis_block",
+    "make_genesis_data",
     "make_genesis_state",
+    "make_keyed_genesis_state",
     "make_mock_signature",
-    "make_public_key_bytes",
-    "make_signature",
     "make_signed_attestation",
     "make_signed_block",
+    "make_signed_block_from_store",
+    "make_store",
+    "make_store_with_attestation_data",
+    "make_store_with_gossip_signatures",
     "make_test_block",
     "make_test_status",
     "make_validators",
-    "make_validators_with_keys",
+    "make_validators_from_key_manager",
     # Mocks
-    "MockNoiseSession",
+    "MockEventSource",
+    "MockForkchoiceStore",
+    "MockNetworkRequester",
     # Constants
     "TEST_VALIDATOR_ID",
-    # Async utilities
-    "run_async",
 ]

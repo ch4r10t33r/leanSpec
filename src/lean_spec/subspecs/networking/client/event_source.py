@@ -1,9 +1,9 @@
 """
 Network event source bridging transport to sync service.
 
-This module implements NetworkEventSource, producing events from real
-network connections. It bridges the gap between the low-level transport
-layer (QUIC ConnectionManager) and the high-level sync service.
+This module produces events from real network connections. It bridges the
+gap between the low-level transport layer (QUIC ConnectionManager) and the
+high-level sync service.
 
 
 WHY THIS MODULE EXISTS
@@ -50,7 +50,7 @@ The message format is:
 +------------------+---------------------------------------------+
 | data_length      | Varint: byte length of compressed data      |
 +------------------+---------------------------------------------+
-| data             | Snappy-framed SSZ-encoded message           |
+| data             | Snappy-compressed SSZ-encoded message       |
 +------------------+---------------------------------------------+
 
 Varints use LEB128 encoding (1-10 bytes depending on value).
@@ -78,7 +78,7 @@ SSZ (Simple Serialize) is Ethereum's canonical serialization format:
 - Fixed overhead: Known sizes enable buffer pre-allocation.
 
 Snappy compression reduces bandwidth by 50-70% for typical blocks.
-The framing format adds CRC32C checksums for corruption detection.
+Gossip uses raw Snappy block format. Req-resp uses Snappy framing with CRC32C.
 
 
 GOSSIPSUB v1.1 REQUIREMENTS
@@ -92,7 +92,7 @@ Key v1.1 features used:
 
 
 References:
-    - Ethereum P2P spec: https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md
+    - Ethereum P2P spec: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md
     - Gossipsub v1.1: https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.1.md
     - SSZ spec: https://github.com/ethereum/consensus-specs/blob/dev/ssz/simple-serialize.md
     - Snappy format: https://github.com/google/snappy/blob/main/format_description.txt
@@ -103,10 +103,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from typing import Final, Protocol, Self
 
-from lean_spec.snappy import SnappyDecompressionError, frame_decompress
+from lean_spec.snappy import SnappyDecompressionError, decompress
 from lean_spec.subspecs.containers import SignedBlockWithAttestation
-from lean_spec.subspecs.containers.attestation import SignedAttestation
+from lean_spec.subspecs.containers.attestation import SignedAggregatedAttestation, SignedAttestation
 from lean_spec.subspecs.networking.config import (
     GOSSIPSUB_DEFAULT_PROTOCOL_ID,
     GOSSIPSUB_PROTOCOL_ID_V12,
@@ -125,11 +126,12 @@ from lean_spec.subspecs.networking.gossipsub.topic import (
 from lean_spec.subspecs.networking.reqresp.handler import (
     REQRESP_PROTOCOL_IDS,
     BlockLookup,
-    DefaultRequestHandler,
     ReqRespServer,
+    RequestHandler,
 )
 from lean_spec.subspecs.networking.reqresp.message import Status
 from lean_spec.subspecs.networking.service.events import (
+    GossipAggregatedAttestationEvent,
     GossipAttestationEvent,
     GossipBlockEvent,
     NetworkEvent,
@@ -138,21 +140,20 @@ from lean_spec.subspecs.networking.service.events import (
     PeerStatusEvent,
 )
 from lean_spec.subspecs.networking.transport import PeerId
-from lean_spec.subspecs.networking.transport.connection import ConnectionManager, Stream
-from lean_spec.subspecs.networking.transport.multistream import (
-    NegotiationError,
-    negotiate_server,
-)
+from lean_spec.subspecs.networking.transport.identity import IdentityKeypair
+from lean_spec.subspecs.networking.transport.protocols import InboundStreamProtocol
 from lean_spec.subspecs.networking.transport.quic.connection import (
     QuicConnection,
     QuicConnectionManager,
-    QuicStream,
     is_quic_multiaddr,
+)
+from lean_spec.subspecs.networking.transport.quic.stream_adapter import (
+    NegotiationError,
+    QuicStreamAdapter,
 )
 from lean_spec.subspecs.networking.varint import (
     VarintError,
     decode_varint,
-    encode_varint,
 )
 from lean_spec.types.exceptions import SSZSerializationError
 
@@ -161,11 +162,32 @@ from .reqresp_client import ReqRespClient
 logger = logging.getLogger(__name__)
 
 
+class EventSource(Protocol):
+    """Protocol for network event sources.
+
+    Defines the minimal interface needed by NetworkService.
+    LiveNetworkEventSource satisfies this with real network I/O.
+    MockEventSource satisfies this for testing.
+    """
+
+    def __aiter__(self) -> Self:
+        """Return self as async iterator."""
+        ...
+
+    async def __anext__(self) -> NetworkEvent:
+        """Yield the next network event."""
+        ...
+
+    async def publish(self, topic: str, data: bytes) -> None:
+        """Broadcast a message to all peers on a topic."""
+        ...
+
+
 class GossipMessageError(Exception):
     """Raised when a gossip message cannot be processed."""
 
 
-SUPPORTED_PROTOCOLS: frozenset[str] = (
+SUPPORTED_PROTOCOLS: Final[frozenset[str]] = (
     frozenset({GOSSIPSUB_DEFAULT_PROTOCOL_ID, GOSSIPSUB_PROTOCOL_ID_V12}) | REQRESP_PROTOCOL_IDS
 )
 """Protocols supported for incoming stream negotiation.
@@ -175,95 +197,6 @@ Includes:
 - GossipSub v1.1 and v1.2
 - Request/response protocols (Status, BlocksByRoot)
 """
-
-
-class _QuicStreamReaderWriter:
-    """Adapts QuicStream for multistream-select negotiation.
-
-    Provides buffered read/write interface matching asyncio StreamReader/Writer.
-    Used during protocol negotiation on QUIC streams.
-    """
-
-    def __init__(self, stream: QuicStream | Stream) -> None:
-        self._stream = stream
-        self._buffer = b""
-        self._write_buffer = b""
-
-    async def read(self, n: int | None = None) -> bytes:
-        """Read bytes from the stream.
-
-        - If n is provided, returns at most n bytes.
-        - If n is None, returns all available data (no limit).
-
-        If buffer has data, returns from buffer.
-        Otherwise reads from stream and buffers excess.
-        """
-        # If no limit, return all buffered data plus new read
-        if n is None:
-            if self._buffer:
-                result = self._buffer
-                self._buffer = b""
-                return result
-            return await self._stream.read()
-
-        # If we have buffered data, return from that first (up to n bytes)
-        if self._buffer:
-            result = self._buffer[:n]
-            self._buffer = self._buffer[n:]
-            return result
-
-        # Read from stream
-        data = await self._stream.read()
-        if not data:
-            return b""
-
-        # Return up to n bytes, buffer the rest
-        if len(data) > n:
-            self._buffer = data[n:]
-            return data[:n]
-        return data
-
-    async def readexactly(self, n: int) -> bytes:
-        """Read exactly n bytes from the stream."""
-        while len(self._buffer) < n:
-            chunk = await self._stream.read()
-            if not chunk:
-                raise EOFError("Stream closed before enough data received")
-            self._buffer += chunk
-
-        result = self._buffer[:n]
-        self._buffer = self._buffer[n:]
-        return result
-
-    def write(self, data: bytes) -> None:
-        """Buffer data for writing (synchronous for StreamWriter compatibility)."""
-        self._write_buffer += data
-
-    async def drain(self) -> None:
-        """Flush buffered data to the stream."""
-        if self._write_buffer:
-            await self._stream.write(self._write_buffer)
-            self._write_buffer = b""
-
-    async def close(self) -> None:
-        """Close the underlying stream."""
-        await self._stream.close()
-
-    async def finish_write(self) -> None:
-        """Half-close the stream (signal end of writing)."""
-        # Flush any buffered data first
-        if self._write_buffer:
-            await self._stream.write(self._write_buffer)
-            self._write_buffer = b""
-        # Call finish_write if available (QUIC streams have this)
-        finish_write = getattr(self._stream, "finish_write", None)
-        if finish_write is not None:
-            await finish_write()
-
-    async def wait_closed(self) -> None:
-        """Wait for the stream to close."""
-        # No-op for QUIC streams
-        pass
 
 
 @dataclass(slots=True)
@@ -285,7 +218,7 @@ class GossipHandler:
     Topics contain:
 
     - Fork digest: 4-byte identifier derived from genesis + fork version.
-    - Message type: "block" or "attestation".
+    - Message type: "blocks" or "attestation".
     - Encoding: Always "ssz_snappy" for Ethereum.
 
     Validating the topic prevents:
@@ -324,7 +257,7 @@ class GossipHandler:
         self,
         topic_str: str,
         compressed_data: bytes,
-    ) -> SignedBlockWithAttestation | SignedAttestation | None:
+    ) -> SignedBlockWithAttestation | SignedAttestation | SignedAggregatedAttestation | None:
         """
         Decode a gossip message from topic and compressed data.
 
@@ -340,7 +273,7 @@ class GossipHandler:
         ForkMismatchError.
 
         Args:
-            topic_str: Full topic string (e.g., "/leanconsensus/0x.../block/ssz_snappy").
+            topic_str: Full topic string (e.g., "/leanconsensus/0x.../blocks/ssz_snappy").
             compressed_data: Snappy-compressed SSZ data.
 
         Returns:
@@ -358,24 +291,19 @@ class GossipHandler:
         # This prevents wasting CPU on malformed or cross-fork messages.
         try:
             topic = GossipTopic.from_string_validated(topic_str, self.fork_digest)
-        except (ValueError, ForkMismatchError) as e:
-            if isinstance(e, ForkMismatchError):
-                raise
+        except ForkMismatchError:
+            raise
+        except ValueError as e:
             raise GossipMessageError(f"Invalid topic: {e}") from e
 
-        # Step 2: Decompress Snappy-framed data.
+        # Step 2: Decompress raw Snappy data.
         #
-        # Ethereum uses Snappy framing format for gossip (same as req/resp).
-        # Framed Snappy includes stream identifier and CRC32C checksums.
-        #
-        # Decompression fails if:
-        #   - Stream identifier is missing or invalid.
-        #   - CRC checksum mismatch (data corruption).
-        #   - Compressed data is truncated.
+        # Gossip uses raw Snappy block format (not framing).
+        # This matches libp2p gossipsub's SnappyTransform behavior.
         #
         # Failed decompression indicates network corruption or a malicious peer.
         try:
-            ssz_bytes = frame_decompress(compressed_data)
+            ssz_bytes = decompress(compressed_data)
         except SnappyDecompressionError as e:
             raise GossipMessageError(f"Snappy decompression failed: {e}") from e
 
@@ -392,6 +320,8 @@ class GossipHandler:
                     return SignedBlockWithAttestation.decode_bytes(ssz_bytes)
                 case TopicKind.ATTESTATION_SUBNET:
                     return SignedAttestation.decode_bytes(ssz_bytes)
+                case TopicKind.AGGREGATED_ATTESTATION:
+                    return SignedAggregatedAttestation.decode_bytes(ssz_bytes)
         except SSZSerializationError as e:
             raise GossipMessageError(f"SSZ decode failed: {e}") from e
 
@@ -411,13 +341,13 @@ class GossipHandler:
         """
         try:
             return GossipTopic.from_string_validated(topic_str, self.fork_digest)
-        except (ValueError, ForkMismatchError) as e:
-            if isinstance(e, ForkMismatchError):
-                raise
+        except ForkMismatchError:
+            raise
+        except ValueError as e:
             raise GossipMessageError(f"Invalid topic: {e}") from e
 
 
-async def read_gossip_message(stream: Stream) -> tuple[str, bytes]:
+async def read_gossip_message(stream: InboundStreamProtocol) -> tuple[str, bytes]:
     """
     Read a gossip message from a QUIC stream.
 
@@ -550,7 +480,6 @@ class LiveNetworkEventSource:
     """
     Produces NetworkEvent objects from real network connections.
 
-    Implements the NetworkEventSource protocol for use with NetworkService.
     Bridges the transport layer (ConnectionManager) to the event-driven
     sync layer.
 
@@ -595,7 +524,7 @@ class LiveNetworkEventSource:
     producers to wait.
     """
 
-    connection_manager: ConnectionManager
+    connection_manager: QuicConnectionManager
     """Underlying transport manager for QUIC connections.
 
     Handles the full connection stack: QUIC transport with TLS 1.3 encryption.
@@ -657,7 +586,7 @@ class LiveNetworkEventSource:
     Tracked for cleanup on shutdown. Tasks remove themselves on completion.
     """
 
-    _reqresp_handler: DefaultRequestHandler = field(init=False)
+    _reqresp_handler: RequestHandler = field(init=False)
     """Handler for inbound ReqResp requests.
 
     Provides chain data to peers requesting Status or BlocksByRoot.
@@ -682,7 +611,7 @@ class LiveNetworkEventSource:
     def __post_init__(self) -> None:
         """Initialize handlers with current configuration."""
         object.__setattr__(self, "_gossip_handler", GossipHandler(fork_digest=self._fork_digest))
-        object.__setattr__(self, "_reqresp_handler", DefaultRequestHandler())
+        object.__setattr__(self, "_reqresp_handler", RequestHandler())
         object.__setattr__(self, "_reqresp_server", ReqRespServer(handler=self._reqresp_handler))
         object.__setattr__(
             self, "_gossipsub_behavior", GossipsubBehavior(params=GossipsubParameters())
@@ -691,7 +620,7 @@ class LiveNetworkEventSource:
     @classmethod
     async def create(
         cls,
-        connection_manager: ConnectionManager | None = None,
+        connection_manager: QuicConnectionManager | None = None,
     ) -> LiveNetworkEventSource:
         """
         Create a new LiveNetworkEventSource.
@@ -703,10 +632,8 @@ class LiveNetworkEventSource:
             Initialized event source.
         """
         if connection_manager is None:
-            from lean_spec.subspecs.networking.transport.identity import IdentityKeypair
-
             identity_key = IdentityKeypair.generate()
-            connection_manager = await ConnectionManager.create(identity_key)
+            connection_manager = await QuicConnectionManager.create(identity_key)
 
         reqresp_client = ReqRespClient(connection_manager=connection_manager)
 
@@ -757,7 +684,7 @@ class LiveNetworkEventSource:
         in mesh management via GRAFT/PRUNE.
 
         Args:
-            topic: Full topic string (e.g., "/leanconsensus/0x.../block/ssz_snappy").
+            topic: Full topic string (e.g., "/leanconsensus/0x.../blocks/ssz_snappy").
         """
         self._gossipsub_behavior.subscribe(topic)
         logger.debug("Subscribed to gossip topic %s", topic)
@@ -788,17 +715,22 @@ class LiveNetworkEventSource:
                     break
                 if isinstance(event, GossipsubMessageEvent):
                     # Decode the message and emit appropriate event.
-                    await self._handle_gossipsub_message(event)
+                    #
+                    # Catch per-message exceptions to prevent one bad message
+                    # from killing the entire forwarding loop.
+                    try:
+                        await self._handle_gossipsub_message(event)
+                    except Exception as e:
+                        logger.warning("Error handling gossipsub message: %s", e)
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.warning("Error forwarding gossipsub events: %s", e)
 
     async def _handle_gossipsub_message(self, event: GossipsubMessageEvent) -> None:
         """
         Handle a message received via GossipSub.
 
-        Decodes the message and emits the appropriate event type.
+        Event data is already decompressed by the gossipsub behavior.
+        Decodes SSZ bytes directly based on topic kind.
 
         Args:
             event: GossipSub message event from the behavior.
@@ -807,17 +739,23 @@ class LiveNetworkEventSource:
             # Parse the topic to determine message type.
             topic = self._gossip_handler.get_topic(event.topic)
 
-            # Decompress and decode the message.
-            message = self._gossip_handler.decode_message(event.topic, event.data)
-
-            # Emit the appropriate event.
-            match topic.kind:
-                case TopicKind.BLOCK:
-                    if isinstance(message, SignedBlockWithAttestation):
-                        await self._emit_gossip_block(message, event.peer_id)
-                case TopicKind.ATTESTATION_SUBNET:
-                    if isinstance(message, SignedAttestation):
-                        await self._emit_gossip_attestation(message, event.peer_id)
+            # Decode SSZ bytes directly.
+            #
+            # The gossipsub behavior already decompressed the Snappy payload
+            # during message ID computation. The event carries decompressed data.
+            try:
+                match topic.kind:
+                    case TopicKind.BLOCK:
+                        block = SignedBlockWithAttestation.decode_bytes(event.data)
+                        await self._emit_gossip_block(block, event.peer_id)
+                    case TopicKind.ATTESTATION_SUBNET:
+                        att = SignedAttestation.decode_bytes(event.data)
+                        await self._emit_gossip_attestation(att, event.peer_id)
+                    case TopicKind.AGGREGATED_ATTESTATION:
+                        agg = SignedAggregatedAttestation.decode_bytes(event.data)
+                        await self._emit_gossip_aggregated_attestation(agg, event.peer_id)
+            except SSZSerializationError as e:
+                raise GossipMessageError(f"SSZ decode failed: {e}") from e
 
             logger.debug("Processed gossipsub message %s from %s", topic.kind.value, event.peer_id)
 
@@ -854,10 +792,10 @@ class LiveNetworkEventSource:
         Connect to a peer at the given multiaddr.
 
         Establishes connection, exchanges Status, and emits events.
-        Automatically detects transport type (TCP or QUIC) from multiaddr.
+        Establishes a QUIC connection to the peer.
 
         Args:
-            multiaddr: Address like "/ip4/127.0.0.1/tcp/9000" or
+            multiaddr: Address like "/ip4/127.0.0.1/udp/9000/quic-v1" or
                       "/ip4/127.0.0.1/udp/9000/quic-v1/p2p/16Uiu2HAm..."
 
         Returns:
@@ -937,10 +875,8 @@ class LiveNetworkEventSource:
         Automatically detects transport type from multiaddr:
 
         - QUIC: Routes to QUIC listener
-        - TCP: Routes to TCP listener
-
         Args:
-            multiaddr: TCP or QUIC address to listen on.
+            multiaddr: QUIC address to listen on.
         """
         self._running = True
 
@@ -1092,7 +1028,7 @@ class LiveNetworkEventSource:
             stream = await conn.open_stream(GOSSIPSUB_DEFAULT_PROTOCOL_ID)
 
             # Wrap in reader/writer for buffered I/O.
-            wrapped_stream = _QuicStreamReaderWriter(stream)
+            wrapped_stream = QuicStreamAdapter(stream)
 
             # Add peer to the gossipsub behavior (outbound stream).
             await self._gossipsub_behavior.add_peer(peer_id, wrapped_stream, inbound=False)
@@ -1172,6 +1108,25 @@ class LiveNetworkEventSource:
             GossipAttestationEvent(attestation=attestation, peer_id=peer_id, topic=topic)
         )
 
+    async def _emit_gossip_aggregated_attestation(
+        self,
+        signed_attestation: SignedAggregatedAttestation,
+        peer_id: PeerId,
+    ) -> None:
+        """
+        Emit a gossip aggregated attestation event.
+
+        Args:
+            signed_attestation: Aggregated attestation received from gossip.
+            peer_id: Peer that sent it.
+        """
+        topic = GossipTopic(kind=TopicKind.AGGREGATED_ATTESTATION, fork_digest=self._fork_digest)
+        await self._events.put(
+            GossipAggregatedAttestationEvent(
+                signed_attestation=signed_attestation, peer_id=peer_id, topic=topic
+            )
+        )
+
     async def _accept_streams(self, peer_id: PeerId, conn: QuicConnection) -> None:
         """
         Accept incoming streams from a connection.
@@ -1236,10 +1191,10 @@ class LiveNetworkEventSource:
                 # Multistream-select runs on top to agree on what protocol to use.
                 # We create a wrapper for buffered I/O during negotiation, and
                 # preserve it for later use (to avoid losing buffered data).
-                wrapper: _QuicStreamReaderWriter | None = None
+                wrapper: QuicStreamAdapter | None = None
 
                 try:
-                    wrapper = _QuicStreamReaderWriter(stream)
+                    wrapper = QuicStreamAdapter(stream)
                     gs_id = self._gossipsub_behavior._instance_id % 0xFFFF
                     logger.debug(
                         "[GS %x] Accepting stream %d from %s, attempting protocol negotiation",
@@ -1248,11 +1203,7 @@ class LiveNetworkEventSource:
                         peer_id,
                     )
                     protocol_id = await asyncio.wait_for(
-                        negotiate_server(
-                            wrapper,
-                            wrapper,  # type: ignore[arg-type]
-                            set(SUPPORTED_PROTOCOLS),
-                        ),
+                        wrapper.negotiate_server(set(SUPPORTED_PROTOCOLS)),
                         timeout=RESP_TIMEOUT,
                     )
                     stream._protocol_id = protocol_id
@@ -1361,7 +1312,7 @@ class LiveNetworkEventSource:
                     assert wrapper is not None
                     task = asyncio.create_task(
                         self._reqresp_server.handle_stream(
-                            wrapper,  # type: ignore[arg-type]
+                            wrapper,
                             protocol_id,
                         )
                     )
@@ -1392,110 +1343,6 @@ class LiveNetworkEventSource:
             # The connection will be cleaned up elsewhere.
             logger.warning("Stream acceptor error for %s: %s", peer_id, e)
 
-    async def _handle_gossip_stream(self, peer_id: PeerId, stream: Stream) -> None:
-        """
-        Handle an incoming gossip stream.
-
-        Reads the gossip message, decodes it, and emits the appropriate event.
-
-        Args:
-            peer_id: Peer that sent the message.
-            stream: QUIC stream containing the gossip message.
-
-
-        COMPLETE FLOW
-        -------------
-        A gossip message goes through these stages:
-
-        1. Read raw bytes from QUIC stream.
-        2. Parse topic string and data length (varints).
-        3. Decompress Snappy-framed data.
-        4. Decode SSZ bytes into typed object.
-        5. Emit event to the sync layer.
-
-        Any stage can fail. Failures are logged but don't crash the handler.
-
-
-        ERROR HANDLING STRATEGY
-        -----------------------
-        Gossip is best-effort. A single bad message should not:
-
-        - Crash the node.
-        - Disconnect the peer.
-        - Block other messages.
-
-        We log errors and continue. Peer scoring (not implemented here)
-        would track repeated failures for reputation management.
-
-
-        RESOURCE CLEANUP
-        ----------------
-        The stream MUST be closed in finally, even if errors occur.
-        Unclosed streams leak QUIC resources and can cause deadlocks.
-        """
-        try:
-            # Step 1: Read the gossip message from the stream.
-            #
-            # This parses the varint-prefixed topic and data fields.
-            # May fail if the message is truncated or malformed.
-            topic_str, compressed_data = await read_gossip_message(stream)
-
-            # Step 2: Decode the message.
-            #
-            # This performs:
-            #   - Topic validation (correct prefix, encoding, fork).
-            #   - Snappy decompression with CRC verification.
-            #   - SSZ decoding into the appropriate type.
-            message = self._gossip_handler.decode_message(topic_str, compressed_data)
-            topic = self._gossip_handler.get_topic(topic_str)
-
-            # Step 3: Emit the appropriate event based on message type.
-            #
-            # The topic determines the expected message type.
-            # We verify the decoded type matches to catch bugs.
-            match topic.kind:
-                case TopicKind.BLOCK:
-                    if isinstance(message, SignedBlockWithAttestation):
-                        await self._emit_gossip_block(message, peer_id)
-                    else:
-                        # Type mismatch indicates a bug in decode_message.
-                        logger.warning("Block topic but got %s", type(message).__name__)
-
-                case TopicKind.ATTESTATION_SUBNET:
-                    if isinstance(message, SignedAttestation):
-                        await self._emit_gossip_attestation(message, peer_id)
-                    else:
-                        # Type mismatch indicates a bug in decode_message.
-                        logger.warning("Attestation topic but got %s", type(message).__name__)
-
-            logger.debug("Received gossip %s from %s", topic.kind.value, peer_id)
-
-        except GossipMessageError as e:
-            # Expected error: malformed message, decompression failure, etc.
-            #
-            # This is not necessarily a bug. The peer may be misbehaving
-            # or there may be network corruption. Log and continue.
-            logger.warning("Gossip message error from %s: %s", peer_id, e)
-
-        except Exception as e:
-            # Unexpected error: likely a bug in our code.
-            #
-            # Log as warning to aid debugging. Don't crash.
-            logger.warning("Unexpected error handling gossip from %s: %s", peer_id, e)
-
-        finally:
-            # Always close the stream to release QUIC resources.
-            #
-            # Unclosed streams cause resource leaks and can deadlock
-            # the connection if too many accumulate.
-            #
-            # The try/except suppresses close errors. The stream may
-            # already be closed if the connection dropped.
-            try:
-                await stream.close()
-            except Exception:
-                pass
-
     async def publish(self, topic: str, data: bytes) -> None:
         """
         Broadcast a message to all connected peers on a topic.
@@ -1520,37 +1367,3 @@ class LiveNetworkEventSource:
             logger.debug("Published message to gossipsub topic %s", topic)
         except Exception as e:
             logger.warning("Failed to publish to gossipsub: %s", e)
-
-    async def _send_gossip_message(
-        self,
-        conn: QuicConnection,
-        topic: str,
-        data: bytes,
-    ) -> None:
-        """
-        Send a gossip message to a peer.
-
-        Opens a new stream for the gossip message and sends the data.
-
-        Args:
-            conn: QuicConnection to the peer.
-            topic: Topic string for the message.
-            data: Message bytes to send.
-        """
-        # Open a new outbound stream for gossip protocol.
-        stream = await conn.open_stream(GOSSIPSUB_DEFAULT_PROTOCOL_ID)
-
-        try:
-            # Format: topic length (varint) + topic + data length (varint) + data
-            topic_bytes = topic.encode("utf-8")
-
-            # Write topic length and topic.
-            await stream.write(encode_varint(len(topic_bytes)))
-            await stream.write(topic_bytes)
-
-            # Write data length and data.
-            await stream.write(encode_varint(len(data)))
-            await stream.write(data)
-
-        finally:
-            await stream.close()

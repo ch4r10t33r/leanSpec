@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from lean_spec.subspecs.containers import Block, Checkpoint, State, ValidatorIndex
 from lean_spec.subspecs.containers.attestation import AttestationData
@@ -30,9 +29,6 @@ from .namespaces import (
     SLOT_INDEX,
     STATES,
 )
-
-if TYPE_CHECKING:
-    pass
 
 
 class SQLiteDatabase:
@@ -105,9 +101,7 @@ class SQLiteDatabase:
 
         self._conn.commit()
 
-    # -------------------------------------------------------------------------
     # Block Operations
-    # -------------------------------------------------------------------------
 
     def get_block(self, root: Bytes32) -> Block | None:
         """Retrieve a block by its root hash."""
@@ -165,9 +159,8 @@ class SQLiteDatabase:
         )
         return cursor.fetchone() is not None
 
-    # -------------------------------------------------------------------------
     # State Operations
-    # -------------------------------------------------------------------------
+
     #
     # States are the full beacon chain state at a given slot.
     # They are large (~2MB+) and expensive to compute from scratch.
@@ -215,9 +208,8 @@ class SQLiteDatabase:
         )
         return cursor.fetchone() is not None
 
-    # -------------------------------------------------------------------------
     # Checkpoint Operations
-    # -------------------------------------------------------------------------
+
     #
     # Checkpoints mark finality progress in the consensus protocol.
     # Justified checkpoints have 2/3 validator support.
@@ -281,9 +273,8 @@ class SQLiteDatabase:
         )
         self._conn.commit()
 
-    # -------------------------------------------------------------------------
     # Attestation Operations
-    # -------------------------------------------------------------------------
+
     #
     # Attestations are validator votes on the canonical chain.
     # Fork choice uses the latest attestation from each validator
@@ -341,9 +332,8 @@ class SQLiteDatabase:
             for row in cursor.fetchall()
         }
 
-    # -------------------------------------------------------------------------
     # Head Tracking
-    # -------------------------------------------------------------------------
+
     #
     # The head is the tip of the canonical chain as determined by fork choice.
     # This is a singleton value that changes as new blocks arrive.
@@ -379,11 +369,10 @@ class SQLiteDatabase:
         )
         self._conn.commit()
 
-    # -------------------------------------------------------------------------
     # Slot Index Operations
-    # -------------------------------------------------------------------------
+
     #
-    # Slots are time intervals (12 seconds each).
+    # Slots are time intervals.
     # This index maps slot numbers to blocks, enabling historical queries.
     # Note: not every slot has a block (missed slots happen).
 
@@ -421,9 +410,8 @@ class SQLiteDatabase:
         )
         self._conn.commit()
 
-    # -------------------------------------------------------------------------
     # Lifecycle
-    # -------------------------------------------------------------------------
+
     #
     # SQLite connections should be explicitly closed when done.
     # The context manager pattern ensures cleanup even on exceptions.

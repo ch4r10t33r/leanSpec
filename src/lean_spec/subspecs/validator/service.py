@@ -37,8 +37,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
-from lean_spec.subspecs import metrics
 from lean_spec.subspecs.chain.clock import Interval, SlotClock
+from lean_spec.subspecs.chain.config import ATTESTATION_COMMITTEE_COUNT
 from lean_spec.subspecs.containers import (
     Attestation,
     AttestationData,
@@ -54,7 +54,7 @@ from lean_spec.subspecs.containers.block import (
 )
 from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.subspecs.xmss import TARGET_SIGNATURE_SCHEME, GeneralizedXmssScheme
-from lean_spec.subspecs.xmss.aggregation import AggregatedSignatureProof
+from lean_spec.subspecs.xmss.aggregation import AggregatedSignatureProof, SignatureKey
 from lean_spec.types import Uint64
 
 from .registry import ValidatorEntry, ValidatorRegistry
@@ -64,9 +64,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-BlockPublisher = Callable[[SignedBlockWithAttestation], Awaitable[None]]
+type BlockPublisher = Callable[[SignedBlockWithAttestation], Awaitable[None]]
 """Callback for publishing signed blocks with proposer attestations."""
-AttestationPublisher = Callable[[SignedAttestation], Awaitable[None]]
+type AttestationPublisher = Callable[[SignedAttestation], Awaitable[None]]
 """Callback for publishing produced attestations."""
 
 
@@ -111,7 +111,7 @@ class ValidatorService:
     _attestations_produced: int = field(default=0, repr=False)
     """Counter for produced attestations."""
 
-    _attested_slots: set[int] = field(default_factory=set, repr=False)
+    _attested_slots: set[Slot] = field(default_factory=set, repr=False)
     """Slots for which we've already produced attestations (prevents duplicates)."""
 
     async def run(self) -> None:
@@ -141,7 +141,7 @@ class ValidatorService:
                 and total_interval <= last_handled_total_interval
             )
             if already_handled:
-                await self._sleep_until_next_interval()
+                await self.clock.sleep_until_next_interval()
                 total_interval = self.clock.total_intervals()
 
             # Skip if we have no validators to manage.
@@ -188,14 +188,13 @@ class ValidatorService:
             # we should still attest as soon as we can within the same slot.
             #
             # We track attested slots to prevent duplicate attestations.
-            slot_int = int(slot)
             logger.debug(
-                "ValidatorService: attestation check interval=%d slot_int=%d attested=%s",
+                "ValidatorService: attestation check interval=%d slot=%d attested=%s",
                 interval,
-                slot_int,
-                slot_int in self._attested_slots,
+                slot,
+                slot in self._attested_slots,
             )
-            if interval >= Uint64(1) and slot_int not in self._attested_slots:
+            if interval >= Uint64(1) and slot not in self._attested_slots:
                 logger.debug(
                     "ValidatorService: producing attestations for slot %d (interval %d)",
                     slot,
@@ -203,13 +202,13 @@ class ValidatorService:
                 )
                 await self._produce_attestations(slot)
                 logger.debug("ValidatorService: done producing attestations for slot %d", slot)
-                self._attested_slots.add(slot_int)
+                self._attested_slots.add(slot)
 
                 # Prune old entries to prevent unbounded growth.
                 #
                 # Keep only recent slots (current slot - 4) to bound memory usage.
                 # We never need to attest for slots that far in the past.
-                prune_threshold = max(0, slot_int - 4)
+                prune_threshold = Slot(max(0, int(slot) - 4))
                 self._attested_slots = {s for s in self._attested_slots if s >= prune_threshold}
 
             # Intervals 2-4 have no additional validator duties.
@@ -286,13 +285,16 @@ class ValidatorService:
                 # This adds our attestation and signatures to the block.
                 signed_block = self._sign_block(block, validator_index, signatures)
 
-                # The proposer's attestation is already stored in the block.
-                # When the block is broadcast, the proposer signature is tracked
-                # in gossip_signatures for future aggregation.
-                # No need to separately process the proposer attestation.
+                # Store proposer's attestation signature locally for aggregation.
+                #
+                # The proposer's block is already in the store from produce_block_with_signatures.
+                # When on_gossip_block is called locally, it returns early (duplicate check).
+                # So the proposer's attestation signature never reaches gossip_signatures
+                # via on_block. We must store it explicitly here so the aggregator
+                # (which may be this same node) can include it in aggregation.
+                self._store_proposer_attestation_signature(signed_block, validator_index)
 
                 self._blocks_produced += 1
-                metrics.blocks_proposed.inc()
 
                 # Emit the block for network propagation.
                 await self.on_block(signed_block)
@@ -323,7 +325,25 @@ class ValidatorService:
         Args:
             slot: Current slot number.
         """
+        # Wait briefly for the current slot's block to arrive via gossip.
+        #
+        # At interval 1 (800ms after slot start), the slot's block may not
+        # have arrived yet from the proposer node (production + gossip + verification
+        # can exceed 800ms on slow machines). Without the block, attestations
+        # would reference an old head, causing safe_target to stall.
         store = self.sync_service.store
+        current_slot_has_block = any(block.slot == slot for block in store.blocks.values())
+        if not current_slot_has_block:
+            for _ in range(8):
+                await asyncio.sleep(0.05)
+                store = self.sync_service.store
+                if any(block.slot == slot for block in store.blocks.values()):
+                    break
+
+        # Ensure we are attesting to the latest known head
+        self.sync_service.store = self.sync_service.store.update_head()
+        store = self.sync_service.store
+
         head_state = store.states.get(store.head)
         if head_state is None:
             return
@@ -348,7 +368,24 @@ class ValidatorService:
             signed_attestation = self._sign_attestation(attestation_data, validator_index)
 
             self._attestations_produced += 1
-            metrics.attestations_produced.inc()
+
+            # Process attestation locally before publishing.
+            #
+            # Gossipsub does not deliver messages back to the sender.
+            # Without local processing, the aggregator node never sees its own
+            # validator's attestation in gossip_signatures, reducing the
+            # aggregation count below the 2/3 safe-target threshold.
+            is_aggregator_role = (
+                self.sync_service.store.validator_id is not None and self.sync_service.is_aggregator
+            )
+            try:
+                self.sync_service.store = self.sync_service.store.on_gossip_attestation(
+                    signed_attestation=signed_attestation,
+                    is_aggregator=is_aggregator_role,
+                )
+            except Exception:
+                # Best-effort: the attestation always goes via gossip regardless.
+                pass
 
             # Emit the attestation for network propagation.
             await self.on_attestation(signed_attestation)
@@ -389,8 +426,8 @@ class ValidatorService:
         if entry is None:
             raise ValueError(f"No secret key for validator {validator_index}")
 
-        # Ensure the XMSS secret key is prepared for this epoch.
-        entry = self._ensure_prepared_for_epoch(entry, block.slot)
+        # Ensure the XMSS secret key is prepared for this slot.
+        entry = self._ensure_prepared_for_slot(entry, block.slot)
 
         proposer_signature = TARGET_SIGNATURE_SCHEME.sign(
             entry.secret_key,
@@ -441,12 +478,12 @@ class ValidatorService:
         if entry is None:
             raise ValueError(f"No secret key for validator {validator_index}")
 
-        # Ensure the XMSS secret key is prepared for this epoch.
-        entry = self._ensure_prepared_for_epoch(entry, attestation_data.slot)
+        # Ensure the XMSS secret key is prepared for this slot.
+        entry = self._ensure_prepared_for_slot(entry, attestation_data.slot)
 
         # Sign the attestation data root.
         #
-        # Uses XMSS one-time signature for the current epoch (slot).
+        # Uses XMSS one-time signature for the current slot.
         signature = TARGET_SIGNATURE_SCHEME.sign(
             entry.secret_key,
             attestation_data.slot,
@@ -455,40 +492,89 @@ class ValidatorService:
 
         return SignedAttestation(
             validator_id=validator_index,
-            message=attestation_data,
+            data=attestation_data,
             signature=signature,
         )
 
-    def _ensure_prepared_for_epoch(
+    def _store_proposer_attestation_signature(
+        self,
+        signed_block: SignedBlockWithAttestation,
+        validator_index: ValidatorIndex,
+    ) -> None:
+        """
+        Store the proposer's attestation signature in gossip_signatures.
+
+        When the proposer produces a block, the block is added to the store
+        immediately. The subsequent local on_gossip_block call returns early
+        because the block is already in the store (duplicate check). This means
+        the proposer's attestation signature never reaches gossip_signatures
+        via the normal on_block path.
+
+        This method explicitly stores the signature so aggregation can include it.
+
+        Args:
+            signed_block: The signed block containing the proposer attestation.
+            validator_index: The proposer's validator index.
+        """
+        store = self.sync_service.store
+        if store.validator_id is None:
+            return
+
+        # Only store if the proposer is in the same subnet as the aggregator.
+        proposer_subnet = validator_index.compute_subnet_id(ATTESTATION_COMMITTEE_COUNT)
+        current_subnet = store.validator_id.compute_subnet_id(ATTESTATION_COMMITTEE_COUNT)
+        if proposer_subnet != current_subnet:
+            return
+
+        proposer_attestation = signed_block.message.proposer_attestation
+        proposer_signature = signed_block.signature.proposer_signature
+        data_root = proposer_attestation.data.data_root_bytes()
+
+        sig_key = SignatureKey(validator_index, data_root)
+        new_gossip_sigs = dict(store.gossip_signatures)
+        new_gossip_sigs[sig_key] = proposer_signature
+
+        # Also store the attestation data for later extraction during aggregation.
+        new_attestation_data_by_root = dict(store.attestation_data_by_root)
+        new_attestation_data_by_root[data_root] = proposer_attestation.data
+
+        self.sync_service.store = store.model_copy(
+            update={
+                "gossip_signatures": new_gossip_sigs,
+                "attestation_data_by_root": new_attestation_data_by_root,
+            }
+        )
+
+    def _ensure_prepared_for_slot(
         self,
         entry: ValidatorEntry,
-        epoch: Slot,
+        slot: Slot,
     ) -> ValidatorEntry:
         """
-        Ensure the secret key is prepared for signing at the given epoch.
+        Ensure the secret key is prepared for signing at the given slot.
 
-        XMSS uses a sliding window of prepared epochs. If the requested epoch
+        XMSS uses a sliding window of prepared slots. If the requested slot
         is outside this window, we advance the preparation by computing
-        additional bottom trees until the epoch is covered.
+        additional bottom trees until the slot is covered.
 
         Args:
             entry: Validator entry containing the secret key.
-            epoch: The epoch (slot) at which we need to sign.
+            slot: The slot at which we need to sign.
 
         Returns:
             The entry, possibly with an updated secret key.
         """
         scheme = cast(GeneralizedXmssScheme, TARGET_SIGNATURE_SCHEME)
-        get_prepared_interval = scheme.get_prepared_interval(entry.secret_key)
+        prepared_interval = scheme.get_prepared_interval(entry.secret_key)
 
-        # If epoch is already in the prepared interval, no action needed.
-        epoch_int = int(epoch)
-        if epoch_int in get_prepared_interval:
+        # If slot is already in the prepared interval, no action needed.
+        slot_int = int(slot)
+        if slot_int in prepared_interval:
             return entry
 
-        # Advance preparation until the epoch is covered.
+        # Advance preparation until the slot is covered.
         secret_key = entry.secret_key
-        while epoch_int not in scheme.get_prepared_interval(secret_key):
+        while slot_int not in scheme.get_prepared_interval(secret_key):
             secret_key = scheme.advance_preparation(secret_key)
 
         # Update the registry with the new secret key.
@@ -499,16 +585,6 @@ class ValidatorService:
         self.registry.add(updated_entry)
 
         return updated_entry
-
-    async def _sleep_until_next_interval(self) -> None:
-        """
-        Sleep until the next interval boundary.
-
-        Uses the clock to calculate precise sleep duration.
-        """
-        sleep_time = self.clock.seconds_until_next_interval()
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
 
     def stop(self) -> None:
         """

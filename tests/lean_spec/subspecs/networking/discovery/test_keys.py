@@ -1,30 +1,16 @@
 """Tests for Discovery v5 key derivation."""
 
-import pytest
-
 from lean_spec.subspecs.networking.discovery.crypto import (
     generate_secp256k1_keypair,
+    pubkey_to_uncompressed,
 )
 from lean_spec.subspecs.networking.discovery.keys import (
     compute_node_id,
     derive_keys,
     derive_keys_from_pubkey,
 )
-
-
-def make_challenge_data(id_nonce: bytes = bytes(16)) -> bytes:
-    """
-    Build mock challenge_data for testing.
-
-    Challenge data format: masking-iv (16) + static-header (23) + authdata (24)
-    Authdata for WHOAREYOU: id-nonce (16) + enr-seq (8)
-    """
-    masking_iv = bytes(16)  # Mock IV
-    # Static header: protocol-id (6) + version (2) + flag (1) + nonce (12) + authdata-size (2)
-    static_header = b"discv5" + b"\x00\x01" + b"\x01" + bytes(12) + b"\x00\x18"
-    # Authdata: id-nonce (16) + enr-seq (8)
-    authdata = id_nonce + bytes(8)
-    return masking_iv + static_header + authdata
+from lean_spec.types import Bytes32, Bytes33
+from tests.lean_spec.helpers import make_challenge_data
 
 
 class TestDeriveKeys:
@@ -32,9 +18,9 @@ class TestDeriveKeys:
 
     def test_derives_two_16_byte_keys(self):
         """Test that key derivation produces two 16-byte keys."""
-        secret = bytes(32)
-        initiator_id = bytes(32)
-        recipient_id = bytes(32)
+        secret = Bytes33(bytes(33))
+        initiator_id = Bytes32(bytes(32))
+        recipient_id = Bytes32(bytes(32))
         challenge_data = make_challenge_data()
 
         init_key, recv_key = derive_keys(secret, initiator_id, recipient_id, challenge_data)
@@ -44,10 +30,10 @@ class TestDeriveKeys:
 
     def test_different_secrets_produce_different_keys(self):
         """Test that different secrets produce different keys."""
-        secret1 = bytes.fromhex("00" * 32)
-        secret2 = bytes.fromhex("01" + "00" * 31)
-        initiator_id = bytes(32)
-        recipient_id = bytes(32)
+        secret1 = Bytes33(bytes.fromhex("00" * 33))
+        secret2 = Bytes33(bytes.fromhex("01" + "00" * 32))
+        initiator_id = Bytes32(bytes(32))
+        recipient_id = Bytes32(bytes(32))
         challenge_data = make_challenge_data()
 
         keys1 = derive_keys(secret1, initiator_id, recipient_id, challenge_data)
@@ -57,10 +43,10 @@ class TestDeriveKeys:
 
     def test_different_node_ids_produce_different_keys(self):
         """Test that different node IDs produce different keys."""
-        secret = bytes(32)
-        initiator_id1 = bytes.fromhex("00" * 32)
-        initiator_id2 = bytes.fromhex("01" + "00" * 31)
-        recipient_id = bytes(32)
+        secret = Bytes33(bytes(33))
+        initiator_id1 = Bytes32(bytes.fromhex("00" * 32))
+        initiator_id2 = Bytes32(bytes.fromhex("01" + "00" * 31))
+        recipient_id = Bytes32(bytes(32))
         challenge_data = make_challenge_data()
 
         keys1 = derive_keys(secret, initiator_id1, recipient_id, challenge_data)
@@ -70,9 +56,9 @@ class TestDeriveKeys:
 
     def test_different_challenge_data_produce_different_keys(self):
         """Test that different challenge data produces different keys."""
-        secret = bytes(32)
-        initiator_id = bytes(32)
-        recipient_id = bytes(32)
+        secret = Bytes33(bytes(33))
+        initiator_id = Bytes32(bytes(32))
+        recipient_id = Bytes32(bytes(32))
         challenge_data1 = make_challenge_data(bytes.fromhex("00" * 16))
         challenge_data2 = make_challenge_data(bytes.fromhex("01" + "00" * 15))
 
@@ -83,30 +69,15 @@ class TestDeriveKeys:
 
     def test_order_matters(self):
         """Test that initiator and recipient order matters."""
-        secret = bytes(32)
-        node_a = bytes.fromhex("aa" * 32)
-        node_b = bytes.fromhex("bb" * 32)
+        secret = Bytes33(bytes(33))
+        node_a = Bytes32(bytes.fromhex("aa" * 32))
+        node_b = Bytes32(bytes.fromhex("bb" * 32))
         challenge_data = make_challenge_data()
 
         keys_ab = derive_keys(secret, node_a, node_b, challenge_data)
         keys_ba = derive_keys(secret, node_b, node_a, challenge_data)
 
         assert keys_ab != keys_ba
-
-    def test_invalid_secret_length_raises(self):
-        """Test that invalid secret length raises ValueError."""
-        with pytest.raises(ValueError, match="Secret must be 32 bytes"):
-            derive_keys(bytes(31), bytes(32), bytes(32), make_challenge_data())
-
-    def test_invalid_initiator_id_length_raises(self):
-        """Test that invalid initiator ID length raises ValueError."""
-        with pytest.raises(ValueError, match="Initiator ID must be 32 bytes"):
-            derive_keys(bytes(32), bytes(31), bytes(32), make_challenge_data())
-
-    def test_invalid_recipient_id_length_raises(self):
-        """Test that invalid recipient ID length raises ValueError."""
-        with pytest.raises(ValueError, match="Recipient ID must be 32 bytes"):
-            derive_keys(bytes(32), bytes(32), bytes(31), make_challenge_data())
 
 
 class TestDeriveKeysFromPubkey:
@@ -122,12 +93,12 @@ class TestDeriveKeysFromPubkey:
 
         # A initiates to B
         send_a, recv_a = derive_keys_from_pubkey(
-            priv_a, pub_b, bytes(node_a), bytes(node_b), challenge_data, is_initiator=True
+            priv_a, pub_b, node_a, node_b, challenge_data, is_initiator=True
         )
 
         # B responds to A
         send_b, recv_b = derive_keys_from_pubkey(
-            priv_b, pub_a, bytes(node_b), bytes(node_a), challenge_data, is_initiator=False
+            priv_b, pub_a, node_b, node_a, challenge_data, is_initiator=False
         )
 
         # A's send key should be B's recv key and vice versa
@@ -174,7 +145,6 @@ class TestComputeNodeId:
 
     def test_accepts_uncompressed_pubkey(self):
         """Test that uncompressed public key format is accepted."""
-        from lean_spec.subspecs.networking.discovery.crypto import pubkey_to_uncompressed
 
         _, compressed = generate_secp256k1_keypair()
         uncompressed = pubkey_to_uncompressed(compressed)
@@ -185,7 +155,6 @@ class TestComputeNodeId:
 
     def test_compressed_and_uncompressed_produce_same_id(self):
         """Test that both formats produce the same node ID."""
-        from lean_spec.subspecs.networking.discovery.crypto import pubkey_to_uncompressed
 
         _, compressed = generate_secp256k1_keypair()
         uncompressed = pubkey_to_uncompressed(compressed)

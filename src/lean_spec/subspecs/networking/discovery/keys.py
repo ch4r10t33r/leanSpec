@@ -27,22 +27,27 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from typing import Final
 
-from lean_spec.types import Bytes32
+from Crypto.Hash import keccak
 
-DISCV5_KEY_AGREEMENT_INFO = b"discovery v5 key agreement"
+from lean_spec.types import Bytes16, Bytes32, Bytes33, Bytes65
+
+from .crypto import ecdh_agree, pubkey_to_uncompressed
+
+DISCV5_KEY_AGREEMENT_INFO: Final = b"discovery v5 key agreement"
 """Info string used in HKDF expansion for Discovery v5 key derivation."""
 
-SESSION_KEY_SIZE = 16
+SESSION_KEY_SIZE: Final = 16
 """Size of each session key in bytes (AES-128)."""
 
 
 def derive_keys(
-    secret: bytes,
-    initiator_id: bytes,
-    recipient_id: bytes,
+    secret: Bytes33,
+    initiator_id: Bytes32,
+    recipient_id: Bytes32,
     challenge_data: bytes,
-) -> tuple[bytes, bytes]:
+) -> tuple[Bytes16, Bytes16]:
     """
     Derive session keys per Discovery v5 specification.
 
@@ -59,7 +64,7 @@ def derive_keys(
         recipient_key = keys[16:32]
 
     Args:
-        secret: 32-byte ECDH shared secret.
+        secret: 33-byte ECDH shared secret (compressed point).
         initiator_id: 32-byte node ID of the handshake initiator.
         recipient_id: 32-byte node ID of the handshake recipient.
         challenge_data: WHOAREYOU packet data (masking-iv || static-header || authdata).
@@ -71,13 +76,6 @@ def derive_keys(
     The initiator uses initiator_key to encrypt and recipient_key to decrypt.
     The recipient uses recipient_key to encrypt and initiator_key to decrypt.
     """
-    if len(secret) != 32:
-        raise ValueError(f"Secret must be 32 bytes, got {len(secret)}")
-    if len(initiator_id) != 32:
-        raise ValueError(f"Initiator ID must be 32 bytes, got {len(initiator_id)}")
-    if len(recipient_id) != 32:
-        raise ValueError(f"Recipient ID must be 32 bytes, got {len(recipient_id)}")
-
     # HKDF-Extract: PRK = HMAC-SHA256(salt, IKM).
     #
     # Using challenge_data as salt binds session keys to the specific WHOAREYOU.
@@ -99,22 +97,20 @@ def derive_keys(
     # SHA-256 outputs 32 bytes, so one round suffices.
     t1 = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
 
-    keys = t1[:32]
-
-    initiator_key = keys[:SESSION_KEY_SIZE]
-    recipient_key = keys[SESSION_KEY_SIZE : SESSION_KEY_SIZE * 2]
+    initiator_key = Bytes16(t1[:SESSION_KEY_SIZE])
+    recipient_key = Bytes16(t1[SESSION_KEY_SIZE : SESSION_KEY_SIZE * 2])
 
     return initiator_key, recipient_key
 
 
 def derive_keys_from_pubkey(
-    local_private_key: bytes,
-    remote_public_key: bytes,
-    local_node_id: bytes,
-    remote_node_id: bytes,
+    local_private_key: Bytes32,
+    remote_public_key: Bytes33 | Bytes65,
+    local_node_id: Bytes32,
+    remote_node_id: Bytes32,
     challenge_data: bytes,
     is_initiator: bool,
-) -> tuple[bytes, bytes]:
+) -> tuple[Bytes16, Bytes16]:
     """
     Derive session keys from ECDH with automatic key ordering.
 
@@ -123,7 +119,7 @@ def derive_keys_from_pubkey(
 
     Args:
         local_private_key: Our 32-byte secp256k1 private key.
-        remote_public_key: Peer's compressed public key.
+        remote_public_key: Peer's compressed (33-byte) or uncompressed (65-byte) public key.
         local_node_id: Our 32-byte node ID.
         remote_node_id: Peer's 32-byte node ID.
         challenge_data: WHOAREYOU packet data (masking-iv || static-header || authdata).
@@ -134,27 +130,25 @@ def derive_keys_from_pubkey(
         - send_key: Use to encrypt outgoing messages.
         - recv_key: Use to decrypt incoming messages.
     """
-    from .crypto import ecdh_agree
-
     # Compute shared secret.
     secret = ecdh_agree(local_private_key, remote_public_key)
 
     # Determine key ordering based on who initiated.
     if is_initiator:
         initiator_key, recipient_key = derive_keys(
-            bytes(secret), local_node_id, remote_node_id, challenge_data
+            secret, local_node_id, remote_node_id, challenge_data
         )
         # We are initiator: use initiator_key to send, recipient_key to receive.
         return initiator_key, recipient_key
     else:
         initiator_key, recipient_key = derive_keys(
-            bytes(secret), remote_node_id, local_node_id, challenge_data
+            secret, remote_node_id, local_node_id, challenge_data
         )
         # We are recipient: use recipient_key to send, initiator_key to receive.
         return recipient_key, initiator_key
 
 
-def compute_node_id(public_key_bytes: bytes) -> Bytes32:
+def compute_node_id(public_key_bytes: Bytes33 | Bytes65) -> Bytes32:
     """
     Compute node ID from public key.
 
@@ -170,10 +164,6 @@ def compute_node_id(public_key_bytes: bytes) -> Bytes32:
     Returns:
         32-byte node ID.
     """
-    from Crypto.Hash import keccak
-
-    from .crypto import pubkey_to_uncompressed
-
     # Ensure uncompressed format.
     uncompressed = pubkey_to_uncompressed(public_key_bytes)
 

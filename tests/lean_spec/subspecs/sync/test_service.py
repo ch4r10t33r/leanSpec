@@ -2,93 +2,31 @@
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, cast
-from unittest.mock import MagicMock
+from typing import cast
 
 import pytest
 
-from lean_spec.subspecs.chain.clock import SlotClock
-from lean_spec.subspecs.containers import SignedBlockWithAttestation
 from lean_spec.subspecs.containers.checkpoint import Checkpoint
 from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.subspecs.containers.validator import ValidatorIndex
-from lean_spec.subspecs.forkchoice import Store
 from lean_spec.subspecs.networking import PeerId
-from lean_spec.subspecs.networking.peer.info import PeerInfo
 from lean_spec.subspecs.networking.reqresp.message import Status
-from lean_spec.subspecs.networking.types import ConnectionState
 from lean_spec.subspecs.ssz.hash import hash_tree_root
-from lean_spec.subspecs.sync.block_cache import BlockCache
-from lean_spec.subspecs.sync.peer_manager import PeerManager
-from lean_spec.subspecs.sync.service import SyncService
+from lean_spec.subspecs.sync.service import SyncProgress, SyncService
 from lean_spec.subspecs.sync.states import SyncState
-from lean_spec.types import Bytes32, Uint64
-from tests.lean_spec.helpers import make_signed_block
-
-
-class MockNetworkRequester:
-    """Mock network for testing."""
-
-    def __init__(self) -> None:
-        """Initialize mock network."""
-        self.blocks_by_root: dict[Bytes32, SignedBlockWithAttestation] = {}
-
-    async def request_blocks_by_root(
-        self,
-        peer_id: PeerId,
-        roots: list[Bytes32],
-    ) -> list[SignedBlockWithAttestation]:
-        """Return blocks for requested roots."""
-        return [self.blocks_by_root[r] for r in roots if r in self.blocks_by_root]
-
-
-class MockStore:
-    """Mock store for testing state machine without real forkchoice."""
-
-    def __init__(self, head_slot: int = 0) -> None:
-        """Initialize mock store."""
-        self._head_slot = head_slot
-        self.head = Bytes32.zero()
-        self.blocks: dict[Bytes32, Any] = {}
-        self._setup_genesis()
-
-    def _setup_genesis(self) -> None:
-        """Set up genesis block."""
-        genesis = MagicMock()
-        genesis.slot = Slot(self._head_slot)
-        self.blocks[self.head] = genesis
-
-    def on_block(self, block: SignedBlockWithAttestation) -> "MockStore":
-        """Process a block and return new store."""
-        new_store = MockStore(int(block.message.block.slot))
-        new_store.blocks = dict(self.blocks)
-        root = hash_tree_root(block.message.block)
-        new_store.blocks[root] = block.message.block
-        new_store.head = root
-        return new_store
-
-
-def create_sync_service(peer_id: PeerId) -> SyncService:
-    """Create a complete SyncService for integration testing."""
-    mock_store = MockStore(head_slot=0)
-    peer_manager = PeerManager()
-    peer_manager.add_peer(PeerInfo(peer_id=peer_id, state=ConnectionState.CONNECTED))
-
-    return SyncService(
-        store=cast(Store, mock_store),
-        peer_manager=peer_manager,
-        block_cache=BlockCache(),
-        clock=SlotClock(genesis_time=Uint64(0), time_fn=lambda: 1000.0),
-        network=MockNetworkRequester(),
-        process_block=lambda s, b: s.on_block(b),
-    )
+from lean_spec.types import Bytes32
+from tests.lean_spec.helpers import (
+    MockForkchoiceStore,
+    create_mock_sync_service,
+    make_signed_attestation,
+    make_signed_block,
+)
 
 
 @pytest.fixture
 def sync_service(peer_id: PeerId) -> SyncService:
     """Provide a complete SyncService for integration testing."""
-    return create_sync_service(peer_id)
+    return create_mock_sync_service(peer_id)
 
 
 class TestStateMachineTransitions:
@@ -98,7 +36,7 @@ class TestStateMachineTransitions:
         """Service starts in IDLE state."""
         assert sync_service.state == SyncState.IDLE
 
-    def test_transitions_to_syncing_on_peer_status(
+    async def test_transitions_to_syncing_on_peer_status(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -109,11 +47,11 @@ class TestStateMachineTransitions:
             head=Checkpoint(root=Bytes32.zero(), slot=Slot(150)),
         )
 
-        asyncio.run(sync_service.on_peer_status(peer_id, status))
+        await sync_service.on_peer_status(peer_id, status)
 
         assert sync_service.state == SyncState.SYNCING
 
-    def test_transitions_to_synced_when_caught_up(
+    async def test_transitions_to_synced_when_caught_up(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -129,11 +67,11 @@ class TestStateMachineTransitions:
         )
         sync_service.peer_manager.update_status(peer_id, status)
 
-        asyncio.run(sync_service._check_sync_complete())
+        await sync_service._check_sync_complete()
 
         assert sync_service.state == SyncState.SYNCED
 
-    def test_stays_syncing_with_orphans(
+    async def test_stays_syncing_with_orphans(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -158,11 +96,11 @@ class TestStateMachineTransitions:
         )
         sync_service.peer_manager.update_status(peer_id, status)
 
-        asyncio.run(sync_service._check_sync_complete())
+        await sync_service._check_sync_complete()
 
         assert sync_service.state == SyncState.SYNCING
 
-    def test_resyncs_when_falls_behind(
+    async def test_resyncs_when_falls_behind(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -176,11 +114,11 @@ class TestStateMachineTransitions:
             head=Checkpoint(root=Bytes32.zero(), slot=Slot(150)),
         )
 
-        asyncio.run(sync_service.on_peer_status(peer_id, status))
+        await sync_service.on_peer_status(peer_id, status)
 
         assert sync_service.state == SyncState.SYNCING
 
-    def test_full_sync_lifecycle(
+    async def test_full_sync_lifecycle(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -194,7 +132,7 @@ class TestStateMachineTransitions:
             finalized=Checkpoint(root=Bytes32.zero(), slot=Slot(100)),
             head=Checkpoint(root=Bytes32.zero(), slot=Slot(150)),
         )
-        asyncio.run(sync_service.on_peer_status(peer_id, ahead_status))
+        await sync_service.on_peer_status(peer_id, ahead_status)
         assert sync_service.state == SyncState.SYNCING
 
         # 2. We catch up (simulate by updating peer status to match our head)
@@ -203,23 +141,23 @@ class TestStateMachineTransitions:
             head=Checkpoint(root=Bytes32.zero(), slot=Slot(0)),
         )
         sync_service.peer_manager.update_status(peer_id, caught_up_status)
-        asyncio.run(sync_service._check_sync_complete())
+        await sync_service._check_sync_complete()
         assert sync_service.state == SyncState.SYNCED
 
         # 3. Network advances -> back to SYNCING
-        asyncio.run(sync_service.on_peer_status(peer_id, ahead_status))
+        await sync_service.on_peer_status(peer_id, ahead_status)
         assert sync_service.state == SyncState.SYNCING
 
         # 4. Catch up again -> SYNCED
         sync_service.peer_manager.update_status(peer_id, caught_up_status)
-        asyncio.run(sync_service._check_sync_complete())
+        await sync_service._check_sync_complete()
         assert sync_service.state == SyncState.SYNCED
 
 
 class TestGossipBlockHandling:
     """Tests for gossip block acceptance based on state."""
 
-    def test_ignores_gossip_in_idle_state(
+    async def test_ignores_gossip_in_idle_state(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -234,13 +172,14 @@ class TestGossipBlockHandling:
             state_root=Bytes32.zero(),
         )
 
-        asyncio.run(sync_service.on_gossip_block(block, peer_id))
+        await sync_service.on_gossip_block(block, peer_id)
 
-        # Block should not be processed or cached
+        # Block should not be processed or cached.
         assert sync_service._blocks_processed == 0
+        assert sync_service.block_cache.orphan_count == 0
         assert len(sync_service.block_cache) == 0
 
-    def test_processes_gossip_in_syncing_state(
+    async def test_processes_gossip_in_syncing_state(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -258,12 +197,12 @@ class TestGossipBlockHandling:
             state_root=Bytes32.zero(),
         )
 
-        asyncio.run(sync_service.on_gossip_block(block, peer_id))
+        await sync_service.on_gossip_block(block, peer_id)
 
         # Block should be processed (parent exists)
         assert sync_service._blocks_processed == 1
 
-    def test_caches_orphan_in_syncing_state(
+    async def test_caches_orphan_in_syncing_state(
         self,
         sync_service: SyncService,
         peer_id: PeerId,
@@ -280,7 +219,7 @@ class TestGossipBlockHandling:
         )
         block_root = hash_tree_root(block.message.block)
 
-        asyncio.run(sync_service.on_gossip_block(block, peer_id))
+        await sync_service.on_gossip_block(block, peer_id)
 
         # Block should be cached as orphan
         assert sync_service._blocks_processed == 0
@@ -299,18 +238,30 @@ class TestProgressReporting:
         """get_progress accurately reflects service state."""
         # Initial progress
         progress = sync_service.get_progress()
-        assert progress.state == SyncState.IDLE
-        assert progress.local_head_slot == 0
-        assert progress.blocks_processed == 0
-        assert progress.peers_connected == 1  # We added one peer in fixture
+        assert progress == SyncProgress(
+            state=SyncState.IDLE,
+            local_head_slot=Slot(0),
+            network_finalized_slot=None,
+            blocks_processed=0,
+            peers_connected=1,
+            cache_size=0,
+            orphan_count=0,
+        )
 
         # After processing some blocks
         sync_service._state = SyncState.SYNCING
         sync_service._blocks_processed = 42
 
         progress = sync_service.get_progress()
-        assert progress.state == SyncState.SYNCING
-        assert progress.blocks_processed == 42
+        assert progress == SyncProgress(
+            state=SyncState.SYNCING,
+            local_head_slot=Slot(0),
+            network_finalized_slot=None,
+            blocks_processed=42,
+            peers_connected=1,
+            cache_size=0,
+            orphan_count=0,
+        )
 
     def test_progress_includes_network_consensus(
         self,
@@ -325,7 +276,15 @@ class TestProgressReporting:
         sync_service.peer_manager.update_status(peer_id, status)
 
         progress = sync_service.get_progress()
-        assert progress.network_finalized_slot == 100
+        assert progress == SyncProgress(
+            state=SyncState.IDLE,
+            local_head_slot=Slot(0),
+            network_finalized_slot=Slot(100),
+            blocks_processed=0,
+            peers_connected=1,
+            cache_size=0,
+            orphan_count=0,
+        )
 
     def test_progress_tracks_cache_state(
         self,
@@ -352,8 +311,15 @@ class TestProgressReporting:
         sync_service.block_cache.mark_orphan(pending1.root)
 
         progress = sync_service.get_progress()
-        assert progress.cache_size == 2
-        assert progress.orphan_count == 1
+        assert progress == SyncProgress(
+            state=SyncState.IDLE,
+            local_head_slot=Slot(0),
+            network_finalized_slot=None,
+            blocks_processed=0,
+            peers_connected=1,
+            cache_size=2,
+            orphan_count=1,
+        )
 
 
 class TestReset:
@@ -389,4 +355,166 @@ class TestReset:
         assert sync_service._blocks_processed == 0
         assert len(sync_service.block_cache) == 0
         assert sync_service._backfill is not None
-        assert len(sync_service._backfill._pending) == 0
+        assert sync_service._backfill._pending == set()
+
+
+class TestAttestationGossipHandling:
+    """Tests for attestation gossip handling."""
+
+    async def test_attestation_accepted_when_synced(
+        self,
+        sync_service: SyncService,
+        peer_id: PeerId,
+    ) -> None:
+        """Attestation is processed when in SYNCED state."""
+        sync_service._state = SyncState.SYNCED
+
+        target = Checkpoint(root=sync_service.store.head, slot=Slot(0))
+        attestation = make_signed_attestation(
+            validator=ValidatorIndex(0),
+            target=target,
+        )
+
+        await sync_service.on_gossip_attestation(attestation)
+
+        mock_store = cast(MockForkchoiceStore, sync_service.store)
+        assert mock_store._attestations_received == [attestation]
+
+    async def test_attestation_rejected_when_idle(
+        self,
+        sync_service: SyncService,
+    ) -> None:
+        """Attestation is ignored when in IDLE state."""
+        assert sync_service.state == SyncState.IDLE
+
+        target = Checkpoint(root=sync_service.store.head, slot=Slot(0))
+        attestation = make_signed_attestation(
+            validator=ValidatorIndex(0),
+            target=target,
+        )
+
+        await sync_service.on_gossip_attestation(attestation)
+
+        mock_store = cast(MockForkchoiceStore, sync_service.store)
+        assert mock_store._attestations_received == []
+
+    async def test_attestation_buffered_when_block_unknown(
+        self,
+        sync_service: SyncService,
+    ) -> None:
+        """Attestation referencing unknown block is buffered for replay."""
+        sync_service._state = SyncState.SYNCING
+
+        # Make the mock store reject this attestation.
+        unknown_root = Bytes32(b"\xab" * 32)
+        target = Checkpoint(root=unknown_root, slot=Slot(99))
+        attestation = make_signed_attestation(
+            validator=ValidatorIndex(0),
+            target=target,
+        )
+
+        # Override on_gossip_attestation to raise for unknown blocks.
+        original_fn = sync_service.store.on_gossip_attestation
+
+        def reject_unknown(signed_attestation, *, is_aggregator=False):
+            if signed_attestation.data.target.root == unknown_root:
+                raise KeyError("Unknown block")
+            return original_fn(signed_attestation, is_aggregator=is_aggregator)
+
+        sync_service.store.on_gossip_attestation = reject_unknown  # type: ignore[assignment]
+
+        await sync_service.on_gossip_attestation(attestation)
+
+        assert sync_service._pending_attestations == [attestation]
+
+    async def test_buffered_attestation_replayed_after_block(
+        self,
+        sync_service: SyncService,
+        peer_id: PeerId,
+    ) -> None:
+        """Buffered attestation is replayed when a new block is processed."""
+        sync_service._state = SyncState.SYNCING
+
+        target = Checkpoint(root=sync_service.store.head, slot=Slot(0))
+        attestation = make_signed_attestation(
+            validator=ValidatorIndex(0),
+            target=target,
+        )
+
+        # Manually buffer an attestation.
+        sync_service._pending_attestations.append(attestation)
+
+        # Process a gossip block to trigger replay.
+        genesis_root = sync_service.store.head
+        block = make_signed_block(
+            slot=Slot(1),
+            proposer_index=ValidatorIndex(0),
+            parent_root=genesis_root,
+            state_root=Bytes32.zero(),
+        )
+
+        await sync_service.on_gossip_block(block, peer_id)
+
+        # Attestation was replayed (accepted by mock store).
+        assert sync_service._pending_attestations == []
+        mock_store = cast(MockForkchoiceStore, sync_service.store)
+        assert attestation in mock_store._attestations_received
+
+
+class TestSyncedGossipBlocks:
+    """Tests for gossip block handling in SYNCED state."""
+
+    async def test_processes_gossip_in_synced_state(
+        self,
+        sync_service: SyncService,
+        peer_id: PeerId,
+    ) -> None:
+        """Gossip blocks are processed when in SYNCED state."""
+        sync_service._state = SyncState.SYNCED
+
+        genesis_root = sync_service.store.head
+        block = make_signed_block(
+            slot=Slot(1),
+            proposer_index=ValidatorIndex(0),
+            parent_root=genesis_root,
+            state_root=Bytes32.zero(),
+        )
+
+        await sync_service.on_gossip_block(block, peer_id)
+
+        assert sync_service._blocks_processed == 1
+
+
+class TestInvalidStateTransition:
+    """Tests for invalid state transitions."""
+
+    async def test_idle_to_synced_raises_value_error(
+        self,
+        sync_service: SyncService,
+    ) -> None:
+        """Direct IDLE -> SYNCED transition raises ValueError."""
+        assert sync_service.state == SyncState.IDLE
+
+        with pytest.raises(ValueError, match="Invalid state transition"):
+            await sync_service._transition_to(SyncState.SYNCED)
+
+
+class TestIdleToCaughtUp:
+    """Tests for IDLE-to-SYNCING when already caught up."""
+
+    async def test_idle_transitions_to_syncing_when_caught_up(
+        self,
+        sync_service: SyncService,
+        peer_id: PeerId,
+    ) -> None:
+        """IDLE transitions to SYNCING even when peer reports same head."""
+        assert sync_service.state == SyncState.IDLE
+
+        # Peer reports finalized at slot 0 (same as our head).
+        status = Status(
+            finalized=Checkpoint(root=Bytes32.zero(), slot=Slot(0)),
+            head=Checkpoint(root=Bytes32.zero(), slot=Slot(0)),
+        )
+        await sync_service.on_peer_status(peer_id, status)
+
+        assert sync_service.state == SyncState.SYNCING

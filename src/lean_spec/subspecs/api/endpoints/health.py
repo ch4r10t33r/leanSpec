@@ -3,23 +3,15 @@
 from __future__ import annotations
 
 import json
+from typing import Final
 
 from aiohttp import web
 
-# =============================================================================
-# SPEC CONSTANTS
-# =============================================================================
-
-STATUS_HEALTHY = "healthy"
+STATUS_HEALTHY: Final = "healthy"
 """Fixed healthy status returned by the health endpoint."""
 
-SERVICE_NAME = "lean-rpc-api"
+SERVICE_NAME: Final = "lean-rpc-api"
 """Fixed service identifier returned by the health endpoint."""
-
-
-# =============================================================================
-# HANDLER
-# =============================================================================
 
 
 async def handle(_request: web.Request) -> web.Response:

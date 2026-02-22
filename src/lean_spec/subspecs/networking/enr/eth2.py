@@ -1,37 +1,30 @@
 """
-Ethereum Consensus ENR Extensions
-=================================
+Ethereum Consensus ENR Extensions.
 
 Ethereum consensus clients extend ENR with additional keys for fork
 compatibility and subnet discovery.
 
-eth2 Key Structure
-------------------
+The "eth2" key contains 16 bytes:
+- fork_digest (4 bytes): current fork identifier
+- next_fork_version (4 bytes): version of next scheduled fork
+- next_fork_epoch (8 bytes): epoch when next fork activates (little-endian)
 
-The `eth2` key contains 16 bytes::
-
-    fork_digest       (4 bytes) - Current fork identifier
-    next_fork_version (4 bytes) - Version of next scheduled fork
-    next_fork_epoch   (8 bytes) - Epoch when next fork activates (little-endian)
-
-attnets / syncnets
-------------------
-
-SSZ Bitvectors indicating subnet subscriptions:
+Subnet subscription keys (SSZ Bitvectors):
 - attnets: Bitvector[64] - attestation subnets (bit i = subscribed to subnet i)
 - syncnets: Bitvector[4] - sync committee subnets
 
-See: https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md
+See: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md
 """
 
-from typing import ClassVar
+from typing import ClassVar, Final
 
+from lean_spec.subspecs.containers.validator import SubnetId
 from lean_spec.subspecs.networking.types import ForkDigest, Version
 from lean_spec.types import StrictBaseModel, Uint64
 from lean_spec.types.bitfields import BaseBitvector
 from lean_spec.types.boolean import Boolean
 
-FAR_FUTURE_EPOCH = Uint64(2**64 - 1)
+FAR_FUTURE_EPOCH: Final = Uint64(2**64 - 1)
 """Sentinel value indicating no scheduled fork."""
 
 
@@ -97,9 +90,9 @@ class AttestationSubnets(BaseBitvector):
             raise ValueError(f"Subnet ID must be 0-63, got {subnet_id}")
         return bool(self.data[subnet_id])
 
-    def subscribed_subnets(self) -> list[int]:
+    def subscribed_subnets(self) -> list[SubnetId]:
         """List of subscribed subnet IDs."""
-        return [i for i in range(self.LENGTH) if self.data[i]]
+        return [SubnetId(i) for i in range(self.LENGTH) if self.data[i]]
 
     def subscription_count(self) -> int:
         """Number of subscribed subnets."""
@@ -142,9 +135,9 @@ class SyncCommitteeSubnets(BaseBitvector):
             raise ValueError(f"Sync subnet ID must be 0-3, got {subnet_id}")
         return bool(self.data[subnet_id])
 
-    def subscribed_subnets(self) -> list[int]:
+    def subscribed_subnets(self) -> list[SubnetId]:
         """List of subscribed sync subnet IDs."""
-        return [i for i in range(self.LENGTH) if self.data[i]]
+        return [SubnetId(i) for i in range(self.LENGTH) if self.data[i]]
 
     def subscription_count(self) -> int:
         """Number of subscribed sync subnets."""

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import pytest
 
-from lean_spec.subspecs.networking import varint
 from lean_spec.subspecs.networking.transport.identity import IdentityKeypair
 from lean_spec.subspecs.networking.transport.peer_id import (
     Base58,
@@ -24,6 +23,7 @@ from lean_spec.subspecs.networking.transport.peer_id import (
     PeerId,
     PublicKeyProto,
 )
+from lean_spec.types import Bytes33
 
 # Protobuf tag constants for test assertions
 _PROTOBUF_TAG_TYPE = 0x08  # (1 << 3) | 0 = field 1, varint
@@ -92,33 +92,6 @@ class TestBase58:
 
         with pytest.raises(ValueError, match="Invalid Base58 character"):
             Base58.decode("l")  # 'l' not in Base58
-
-
-class TestVarintEncoding:
-    """Tests for varint encoding."""
-
-    def test_encode_zero(self) -> None:
-        """Zero encodes to single byte."""
-        assert varint.encode_varint(0) == b"\x00"
-
-    def test_encode_small_values(self) -> None:
-        """Values < 128 encode to single byte."""
-        assert varint.encode_varint(1) == b"\x01"
-        assert varint.encode_varint(127) == b"\x7f"
-
-    def test_encode_128(self) -> None:
-        """128 requires two bytes."""
-        assert varint.encode_varint(128) == b"\x80\x01"
-
-    def test_encode_large_values(self) -> None:
-        """Large values use multiple bytes."""
-        assert varint.encode_varint(300) == b"\xac\x02"
-        assert varint.encode_varint(16384) == b"\x80\x80\x01"
-
-    def test_encode_negative_raises(self) -> None:
-        """Negative values raise ValueError."""
-        with pytest.raises(ValueError, match="non-negative"):
-            varint.encode_varint(-1)
 
 
 class TestMultihash:
@@ -301,23 +274,6 @@ class TestDerivePeerId:
 
         assert str(peer_id1) != str(peer_id2)
 
-    def test_derive_general_function(self) -> None:
-        """PeerId.derive() works with key data and type."""
-        key_data = bytes([0x02] + [0] * 32)  # secp256k1 compressed format
-        peer_id = PeerId.derive(key_data, KeyType.SECP256K1)
-
-        peer_id_str = str(peer_id)
-        assert len(peer_id_str) > 0
-        assert all(c in Base58.ALPHABET for c in peer_id_str)
-
-    def test_from_secp256k1_invalid_length(self) -> None:
-        """from_secp256k1 rejects invalid key lengths."""
-        with pytest.raises(ValueError, match="must be 33 bytes"):
-            PeerId.from_secp256k1(bytes(32))
-
-        with pytest.raises(ValueError, match="must be 33 bytes"):
-            PeerId.from_secp256k1(bytes(34))
-
 
 class TestPeerIdFormat:
     """Tests for PeerId format and structure."""
@@ -339,7 +295,7 @@ class TestPeerIdFormat:
         # Create a key type that produces > 42 bytes encoded
         # A 128-byte key should exceed the limit
         large_key = bytes(128)
-        peer_id = PeerId.derive(large_key, KeyType.RSA)
+        peer_id = PeerId.from_public_key(PublicKeyProto(key_type=KeyType.RSA, key_data=large_key))
 
         decoded = Base58.decode(str(peer_id))
 
@@ -519,8 +475,8 @@ class TestKnownVectors:
         This matches the libp2p spec test vector.
         """
         # From spec: 08021221037777e994e452c21604f91de093ce415f5432f701dd8cd1a7a6fea0e630bfca99
-        key_data = bytes.fromhex(
-            "037777e994e452c21604f91de093ce415f5432f701dd8cd1a7a6fea0e630bfca99"
+        key_data = Bytes33(
+            bytes.fromhex("037777e994e452c21604f91de093ce415f5432f701dd8cd1a7a6fea0e630bfca99")
         )
         peer_id = PeerId.from_secp256k1(key_data)
 

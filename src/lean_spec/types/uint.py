@@ -14,6 +14,8 @@ from .ssz_base import SSZType
 class BaseUint(int, SSZType):
     """A base class for custom unsigned integer types that inherits from `int`."""
 
+    __slots__ = ()
+
     BITS: ClassVar[int]
     """The number of bits in the integer (overridden by subclasses)."""
 
@@ -22,8 +24,8 @@ class BaseUint(int, SSZType):
         Create and validate a new Uint instance.
 
         Raises:
-            SSZTypeCoercionError: If `value` is not an int (rejects bool, string, float).
-            SSZOverflowError: If `value` is outside the allowed range [0, 2**BITS - 1].
+            SSZTypeError: If `value` is not an int (rejects bool, string, float).
+            SSZValueError: If `value` is outside the allowed range [0, 2**BITS - 1].
         """
         # We should accept only ints.
         if not isinstance(value, int) or isinstance(value, bool):
@@ -344,13 +346,13 @@ class BaseUint(int, SSZType):
         return type(self)(int(other) >> int(self))
 
     def __eq__(self, other: object) -> bool:
-        """Handle the equality operator (`==`)"""
+        """Handle the equality operator (`==`)."""
         if not isinstance(other, BaseUint):
             self._raise_type_error(other, "==")
         return super().__eq__(other)
 
     def __ne__(self, other: object) -> bool:
-        """Handle the inequality operator (`!=`)"""
+        """Handle the inequality operator (`!=`)."""
         if not isinstance(other, BaseUint):
             self._raise_type_error(other, "!=")
         return super().__ne__(other)

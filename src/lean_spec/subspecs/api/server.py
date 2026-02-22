@@ -26,10 +26,6 @@ logger = logging.getLogger(__name__)
 _routes = [web.get(path, handler) for path, handler in ROUTES.items()]
 """aiohttp route definitions generated from ROUTES."""
 
-
-# =============================================================================
-# IMPLEMENTATION-SPECIFIC
-# =============================================================================
 # The following classes are implementation details.
 # Other implementations may structure their code differently.
 
@@ -103,7 +99,7 @@ class ApiServer:
         self._site = web.TCPSite(self._runner, self.config.host, self.config.port)
         await self._site.start()
 
-        logger.info(f"API server listening on {self.config.host}:{self.config.port}")
+        logger.info("API server listening on %s:%d", self.config.host, self.config.port)
 
     async def run(self) -> None:
         """

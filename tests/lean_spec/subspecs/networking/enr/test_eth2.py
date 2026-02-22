@@ -3,14 +3,15 @@
 import pytest
 from pydantic import ValidationError
 
+from lean_spec.subspecs.containers.validator import SubnetId
 from lean_spec.subspecs.networking.enr import Eth2Data
 from lean_spec.subspecs.networking.enr.eth2 import (
     FAR_FUTURE_EPOCH,
     AttestationSubnets,
     SyncCommitteeSubnets,
 )
+from lean_spec.subspecs.networking.types import ForkDigest, Version
 from lean_spec.types import Uint64
-from lean_spec.types.byte_arrays import Bytes4
 
 
 class TestEth2Data:
@@ -19,17 +20,17 @@ class TestEth2Data:
     def test_create_eth2_data(self) -> None:
         """Eth2Data can be created with valid parameters."""
         data = Eth2Data(
-            fork_digest=Bytes4(b"\x12\x34\x56\x78"),
-            next_fork_version=Bytes4(b"\x02\x00\x00\x00"),
+            fork_digest=ForkDigest(b"\x12\x34\x56\x78"),
+            next_fork_version=Version(b"\x02\x00\x00\x00"),
             next_fork_epoch=Uint64(194048),
         )
-        assert data.fork_digest == Bytes4(b"\x12\x34\x56\x78")
+        assert data.fork_digest == ForkDigest(b"\x12\x34\x56\x78")
         assert data.next_fork_epoch == Uint64(194048)
 
     def test_no_scheduled_fork_factory(self) -> None:
         """no_scheduled_fork factory creates correct data."""
-        digest = Bytes4(b"\xab\xcd\xef\x01")
-        version = Bytes4(b"\x01\x00\x00\x00")
+        digest = ForkDigest(b"\xab\xcd\xef\x01")
+        version = Version(b"\x01\x00\x00\x00")
         data = Eth2Data.no_scheduled_fork(digest, version)
 
         assert data.fork_digest == digest
@@ -39,12 +40,12 @@ class TestEth2Data:
     def test_eth2_data_immutable(self) -> None:
         """Eth2Data is immutable (frozen)."""
         data = Eth2Data(
-            fork_digest=Bytes4(b"\x12\x34\x56\x78"),
-            next_fork_version=Bytes4(b"\x02\x00\x00\x00"),
+            fork_digest=ForkDigest(b"\x12\x34\x56\x78"),
+            next_fork_version=Version(b"\x02\x00\x00\x00"),
             next_fork_epoch=Uint64(0),
         )
         with pytest.raises(ValidationError):
-            data.fork_digest = Bytes4(b"\x00\x00\x00\x00")
+            data.fork_digest = ForkDigest(b"\x00\x00\x00\x00")
 
     def test_far_future_epoch_value(self) -> None:
         """FAR_FUTURE_EPOCH is max uint64."""
@@ -82,7 +83,7 @@ class TestAttestationSubnets:
         subnets = AttestationSubnets.from_subnet_ids([10, 20, 30])
         result = subnets.subscribed_subnets()
 
-        assert result == [10, 20, 30]
+        assert result == [SubnetId(10), SubnetId(20), SubnetId(30)]
 
     def test_invalid_subnet_id_in_from_subnet_ids(self) -> None:
         """from_subnet_ids() raises for invalid subnet IDs."""
@@ -112,7 +113,7 @@ class TestAttestationSubnets:
         """from_subnet_ids handles duplicates correctly."""
         subnets = AttestationSubnets.from_subnet_ids([5, 5, 5, 10])
         assert subnets.subscription_count() == 2
-        assert subnets.subscribed_subnets() == [5, 10]
+        assert subnets.subscribed_subnets() == [SubnetId(5), SubnetId(10)]
 
     def test_encode_bytes_empty(self) -> None:
         """Empty subscriptions serialize to 8 zero bytes."""
@@ -188,7 +189,7 @@ class TestSyncCommitteeSubnets:
         """from_subnet_ids handles duplicates correctly."""
         subnets = SyncCommitteeSubnets.from_subnet_ids([1, 1, 1, 3])
         assert subnets.subscription_count() == 2
-        assert subnets.subscribed_subnets() == [1, 3]
+        assert subnets.subscribed_subnets() == [SubnetId(1), SubnetId(3)]
 
     def test_from_subnet_ids_invalid(self) -> None:
         """from_subnet_ids() raises for invalid subnet IDs."""
@@ -201,7 +202,7 @@ class TestSyncCommitteeSubnets:
     def test_subscribed_subnets(self) -> None:
         """subscribed_subnets() returns correct list."""
         subnets = SyncCommitteeSubnets.from_subnet_ids([1, 3])
-        assert subnets.subscribed_subnets() == [1, 3]
+        assert subnets.subscribed_subnets() == [SubnetId(1), SubnetId(3)]
 
     def test_subscription_count(self) -> None:
         """subscription_count() returns correct count."""

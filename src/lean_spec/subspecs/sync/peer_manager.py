@@ -6,15 +6,32 @@ Tracks peer chain status and selects peers for block requests.
 
 from __future__ import annotations
 
+import random
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Final
 
 from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.subspecs.networking import PeerId
-from lean_spec.subspecs.networking.peer.info import PeerInfo
+from lean_spec.subspecs.networking.peer import PeerInfo
 from lean_spec.subspecs.networking.reqresp.message import Status
 
 from .config import MAX_CONCURRENT_REQUESTS
+
+INITIAL_PEER_SCORE: Final = 100
+"""Starting score for newly added peers."""
+
+MIN_PEER_SCORE: Final = 0
+"""Minimum peer score (floor)."""
+
+MAX_PEER_SCORE: Final = 200
+"""Maximum peer score (ceiling)."""
+
+SCORE_SUCCESS_BONUS: Final = 10
+"""Score increase for a successful request."""
+
+SCORE_FAILURE_PENALTY: Final = 20
+"""Score decrease for a failed request."""
 
 
 @dataclass(slots=True)
@@ -33,6 +50,9 @@ class SyncPeer:
 
     requests_in_flight: int = 0
     """Number of active requests to this peer."""
+
+    score: int = INITIAL_PEER_SCORE
+    """Peer reputation score. Higher means more reliable."""
 
     @property
     def peer_id(self) -> PeerId:
@@ -105,7 +125,10 @@ class PeerManager:
 
     def select_peer_for_request(self, min_slot: Slot | None = None) -> SyncPeer | None:
         """
-        Select an available peer for a request.
+        Select an available peer for a request using weighted random selection.
+
+        Peers with higher scores are more likely to be selected. This avoids
+        concentrating all load on one peer and naturally prefers reliable peers.
 
         Args:
             min_slot: Optional minimum slot the peer must have.
@@ -113,13 +136,20 @@ class PeerManager:
         Returns:
             An available SyncPeer, or None if no suitable peer exists.
         """
+        candidates: list[SyncPeer] = []
         for peer in self._peers.values():
             if not peer.is_available():
                 continue
             if min_slot is not None and not peer.has_slot(min_slot):
                 continue
-            return peer
-        return None
+            candidates.append(peer)
+
+        if not candidates:
+            return None
+
+        # Weight by score. A score of 0 still gets weight 1 to avoid exclusion.
+        weights = [max(peer.score, 1) for peer in candidates]
+        return random.choices(candidates, weights=weights, k=1)[0]
 
     def get_network_finalized_slot(self) -> Slot | None:
         """
@@ -142,12 +172,14 @@ class PeerManager:
         peer = self._peers.get(peer_id)
         if peer is not None:
             peer.on_request_complete()
+            peer.score = min(peer.score + SCORE_SUCCESS_BONUS, MAX_PEER_SCORE)
 
     def on_request_failure(self, peer_id: PeerId) -> None:
         """Record a failed request to a peer."""
         peer = self._peers.get(peer_id)
         if peer is not None:
             peer.on_request_complete()
+            peer.score = max(peer.score - SCORE_FAILURE_PENALTY, MIN_PEER_SCORE)
 
     def get_all_peers(self) -> list[SyncPeer]:
         """Get all tracked peers."""

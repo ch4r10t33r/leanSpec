@@ -3,13 +3,13 @@
 import asyncio
 import threading
 import time
-from typing import TYPE_CHECKING, Generator
+from typing import Generator
 
 import httpx
 import pytest
 
-if TYPE_CHECKING:
-    from lean_spec.subspecs.api import ApiServer
+from lean_spec.subspecs.api import ApiServer, ApiServerConfig
+from tests.lean_spec.helpers import make_store
 
 # Default port for auto-started local server
 DEFAULT_PORT = 15099
@@ -45,38 +45,9 @@ class _ServerThread(threading.Thread):
             if self.loop:
                 self.loop.close()
 
-    def _create_server(self) -> "ApiServer":
+    def _create_server(self) -> ApiServer:
         """Create the API server with a test store."""
-        from lean_spec.subspecs.api import ApiServer, ApiServerConfig
-        from lean_spec.subspecs.containers import Block, BlockBody, State, Validator
-        from lean_spec.subspecs.containers.block.types import AggregatedAttestations
-        from lean_spec.subspecs.containers.slot import Slot
-        from lean_spec.subspecs.containers.state import Validators
-        from lean_spec.subspecs.containers.validator import ValidatorIndex
-        from lean_spec.subspecs.forkchoice import Store
-        from lean_spec.subspecs.ssz.hash import hash_tree_root
-        from lean_spec.types import Bytes32, Bytes52, Uint64
-
-        validators = Validators(
-            data=[
-                Validator(pubkey=Bytes52(b"\x00" * 52), index=ValidatorIndex(i)) for i in range(3)
-            ]
-        )
-
-        genesis_state = State.generate_genesis(
-            genesis_time=Uint64(int(time.time())),
-            validators=validators,
-        )
-
-        genesis_block = Block(
-            slot=Slot(0),
-            proposer_index=ValidatorIndex(0),
-            parent_root=Bytes32.zero(),
-            state_root=hash_tree_root(genesis_state),
-            body=BlockBody(attestations=AggregatedAttestations(data=[])),
-        )
-
-        store = Store.get_forkchoice_store(genesis_state, genesis_block, None)
+        store = make_store(num_validators=3, validator_id=None, genesis_time=int(time.time()))
 
         config = ApiServerConfig(host="127.0.0.1", port=self.port)
         return ApiServer(config=config, store_getter=lambda: store)

@@ -10,26 +10,27 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
+from lean_spec.subspecs.chain.config import ATTESTATION_COMMITTEE_COUNT
 from lean_spec.subspecs.containers import Checkpoint, Validator
+from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.subspecs.containers.state import Validators
 from lean_spec.subspecs.containers.validator import ValidatorIndex
+from lean_spec.subspecs.forkchoice import Store
 from lean_spec.subspecs.networking import PeerId
 from lean_spec.subspecs.networking.client import LiveNetworkEventSource
-from lean_spec.subspecs.networking.peer.info import PeerInfo
+from lean_spec.subspecs.networking.peer import PeerInfo
 from lean_spec.subspecs.networking.reqresp.message import Status
 from lean_spec.subspecs.networking.types import ConnectionState
 from lean_spec.subspecs.node import Node, NodeConfig
 from lean_spec.subspecs.validator import ValidatorRegistry
 from lean_spec.subspecs.validator.registry import ValidatorEntry
-from lean_spec.subspecs.xmss import TARGET_SIGNATURE_SCHEME
-from lean_spec.types import Bytes32, Bytes52, Uint64
+from lean_spec.subspecs.xmss import TARGET_SIGNATURE_SCHEME, SecretKey
+from lean_spec.types import Bytes52, Uint64
 
+from .diagnostics import PipelineDiagnostics
 from .port_allocator import PortAllocator
-
-if TYPE_CHECKING:
-    from lean_spec.subspecs.xmss import SecretKey
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,6 @@ class TestNode:
     listen_addr: str
     """P2P listen address (e.g., '/ip4/127.0.0.1/udp/20600/quic-v1')."""
 
-    api_port: int
-    """HTTP API port."""
-
     index: int
     """Node index in the cluster."""
 
@@ -64,7 +62,7 @@ class TestNode:
     """Background task for the QUIC listener."""
 
     @property
-    def _store(self):
+    def _store(self) -> Store:
         """Get the live store from sync_service (not the stale node.store snapshot)."""
         return self.node.sync_service.store
 
@@ -88,15 +86,33 @@ class TestNode:
     def peer_count(self) -> int:
         """Number of connected peers.
 
-        Uses event_source._connections for consistency with disconnect_all().
-        The peer_manager is updated asynchronously and may lag behind.
+        Reads the raw connection map rather than the peer manager,
+        which is updated asynchronously and may lag behind.
         """
         return len(self.event_source._connections)
 
-    @property
-    def head_root(self) -> Bytes32:
-        """Current head root."""
-        return self._store.head
+    def diagnostics(self) -> PipelineDiagnostics:
+        """
+        Take a point-in-time snapshot of this node's pipeline state.
+
+        Values are read from the live mutable store and may differ between calls.
+        """
+        store = self._store
+
+        # The safe target may not have a corresponding block yet
+        # (e.g., during early startup before any blocks are produced).
+        safe_block = store.blocks.get(store.safe_target)
+
+        return PipelineDiagnostics(
+            head_slot=self.head_slot,
+            safe_target_slot=int(safe_block.slot) if safe_block else 0,
+            finalized_slot=self.finalized_slot,
+            justified_slot=self.justified_slot,
+            gossip_signatures_count=len(store.gossip_signatures),
+            new_aggregated_count=len(store.latest_new_aggregated_payloads),
+            known_aggregated_count=len(store.latest_known_aggregated_payloads),
+            block_count=len(store.blocks),
+        )
 
     async def start(self) -> None:
         """Start the node in background."""
@@ -151,26 +167,6 @@ class TestNode:
             logger.warning("Dial to %s timed out after %.1fs", addr, timeout)
             return False
 
-    @property
-    def connected_peers(self) -> list[PeerId]:
-        """List of currently connected peer IDs."""
-        return list(self.event_source._connections.keys())
-
-    async def disconnect_peer(self, peer_id: PeerId) -> None:
-        """
-        Disconnect from a specific peer.
-
-        Args:
-            peer_id: Peer to disconnect.
-        """
-        await self.event_source.disconnect(peer_id)
-        logger.info("Node %d disconnected from peer %s", self.index, peer_id)
-
-    async def disconnect_all(self) -> None:
-        """Disconnect from all peers."""
-        for peer_id in list(self.connected_peers):
-            await self.disconnect_peer(peer_id)
-
 
 @dataclass(slots=True)
 class NodeCluster:
@@ -192,7 +188,7 @@ class NodeCluster:
     _validators: Validators | None = field(default=None, repr=False)
     """Shared validator set."""
 
-    _secret_keys: dict[int, SecretKey] = field(default_factory=dict, repr=False)
+    _secret_keys: dict[ValidatorIndex, SecretKey] = field(default_factory=dict, repr=False)
     """Secret keys by validator index."""
 
     _genesis_time: int = field(default=0, repr=False)
@@ -204,6 +200,8 @@ class NodeCluster:
     def __post_init__(self) -> None:
         """Initialize validators and keys."""
         self._generate_validators()
+        # Default genesis time for single-node starts.
+        # start_all() overrides this to align with service start.
         self._genesis_time = int(time.time())
 
     def _generate_validators(self) -> None:
@@ -211,15 +209,15 @@ class NodeCluster:
         validators: list[Validator] = []
         scheme = TARGET_SIGNATURE_SCHEME
 
-        # Use a number of active epochs within the scheme's lifetime.
+        # Use a number of active slots within the scheme's lifetime.
         # TEST_CONFIG has LOG_LIFETIME=8 -> lifetime=256.
         # PROD_CONFIG has LOG_LIFETIME=32 -> lifetime=2^32.
-        # Use the full lifetime to avoid exhausting prepared epochs during tests.
-        num_active_epochs = int(scheme.config.LIFETIME)
+        # Use the full lifetime to avoid exhausting prepared slots during tests.
+        num_active_slots = int(scheme.config.LIFETIME)
 
         for i in range(self.num_validators):
-            keypair = scheme.key_gen(Uint64(0), Uint64(num_active_epochs))
-            self._secret_keys[i] = keypair.secret
+            keypair = scheme.key_gen(Slot(0), Uint64(num_active_slots))
+            self._secret_keys[ValidatorIndex(i)] = keypair.secret
 
             pubkey_bytes = keypair.public.encode_bytes()[:52]
             pubkey = Bytes52(pubkey_bytes.ljust(52, b"\x00"))
@@ -236,7 +234,8 @@ class NodeCluster:
     async def start_node(
         self,
         node_index: int,
-        validator_indices: list[int] | None = None,
+        validator_indices: list[ValidatorIndex] | None = None,
+        is_aggregator: bool = False,
         bootnodes: list[str] | None = None,
         *,
         start_services: bool = True,
@@ -247,6 +246,7 @@ class NodeCluster:
         Args:
             node_index: Index for this node (for logging/identification).
             validator_indices: Which validators this node controls.
+            is_aggregator: Whether this node is an aggregator.
             bootnodes: Addresses to connect to on startup.
             start_services: If True, start the node's services immediately.
                 If False, call test_node.start() manually after mesh is stable.
@@ -254,7 +254,7 @@ class NodeCluster:
         Returns:
             Started TestNode.
         """
-        p2p_port, api_port = self.port_allocator.allocate_ports()
+        p2p_port = self.port_allocator.allocate_port()
         # QUIC over UDP is the only supported transport.
         # QUIC provides native multiplexing, flow control, and TLS 1.3 encryption.
         listen_addr = f"/ip4/127.0.0.1/udp/{p2p_port}/quic-v1"
@@ -285,6 +285,7 @@ class NodeCluster:
             api_config=None,  # Disable API server for interop tests (not needed for P2P testing)
             validator_registry=validator_registry,
             fork_digest=self.fork_digest,
+            is_aggregator=is_aggregator,
         )
 
         node = Node.from_genesis(config)
@@ -322,7 +323,6 @@ class NodeCluster:
             node=node,
             event_source=event_source,
             listen_addr=listen_addr,
-            api_port=api_port,
             index=node_index,
         )
 
@@ -352,10 +352,20 @@ class NodeCluster:
 
         await event_source.start_gossipsub()
 
-        block_topic = f"/leanconsensus/{self.fork_digest}/block/ssz_snappy"
-        attestation_topic = f"/leanconsensus/{self.fork_digest}/attestation/ssz_snappy"
+        block_topic = f"/leanconsensus/{self.fork_digest}/blocks/ssz_snappy"
+        aggregation_topic = f"/leanconsensus/{self.fork_digest}/aggregation/ssz_snappy"
         event_source.subscribe_gossip_topic(block_topic)
-        event_source.subscribe_gossip_topic(attestation_topic)
+        event_source.subscribe_gossip_topic(aggregation_topic)
+
+        # Determine subnets for our validators and subscribe.
+        #
+        # Validators only subscribe to the subnets they are assigned to.
+        # This matches the Ethereum gossip specification.
+        if validator_indices:
+            for idx in validator_indices:
+                subnet_id = int(idx) % int(ATTESTATION_COMMITTEE_COUNT)
+                topic = f"/leanconsensus/{self.fork_digest}/attestation_{subnet_id}/ssz_snappy"
+                event_source.subscribe_gossip_topic(topic)
 
         # Optionally start the node's services.
         #
@@ -373,10 +383,9 @@ class NodeCluster:
         # Log node startup with gossipsub instance ID for debugging.
         gs_id = event_source._gossipsub_behavior._instance_id % 0xFFFF
         logger.info(
-            "Started node %d on %s (API: %d, validators: %s, services=%s, GS=%x)",
+            "Started node %d on %s (validators: %s, services=%s, GS=%x)",
             node_index,
             listen_addr,
-            api_port,
             validator_indices,
             "running" if start_services else "pending",
             gs_id,
@@ -387,7 +396,7 @@ class NodeCluster:
     async def start_all(
         self,
         topology: list[tuple[int, int]],
-        validators_per_node: list[list[int]] | None = None,
+        validators_per_node: list[list[ValidatorIndex]] | None = None,
     ) -> None:
         """
         Start multiple nodes with given topology.
@@ -406,14 +415,33 @@ class NodeCluster:
         if validators_per_node is None:
             validators_per_node = self._distribute_validators(num_nodes)
 
+        # Set genesis time to coincide with service start.
+        #
+        # Phases 1-3 (node creation, connection, mesh stabilization) take ~10s.
+        # Setting genesis 15s in the future provides margin for slow environments
+        # (CI, heavy load) where setup may exceed 10s.
+        # Prevents wasting slots before the mesh is ready.
+        self._genesis_time = int(time.time()) + 15
+
         # Phase 1: Create nodes with networking ready but services not running.
         #
         # This allows the gossipsub mesh to form before validators start
         # producing blocks and attestations. Otherwise, early blocks/attestations
         # would be "Published message to 0 peers" because the mesh is empty.
+        aggregator_indices = {ValidatorIndex(i) for i in range(int(ATTESTATION_COMMITTEE_COUNT))}
         for i in range(num_nodes):
             validator_indices = validators_per_node[i] if i < len(validators_per_node) else []
-            await self.start_node(i, validator_indices, start_services=False)
+
+            # A node is an aggregator if it controls any of the first
+            # ATTESTATION_COMMITTEE_COUNT validators.
+            is_node_aggregator = any(vid in aggregator_indices for vid in validator_indices)
+
+            await self.start_node(
+                i,
+                validator_indices,
+                is_aggregator=is_node_aggregator,
+                start_services=False,
+            )
 
             # Stagger node startup like Ream does.
             #
@@ -442,7 +470,7 @@ class NodeCluster:
         # 2. Subscription RPCs to be exchanged
         # 3. GRAFT messages to be sent and processed
         #
-        # A longer delay ensures proper mesh formation before block production.
+        # 5s allows ~7 heartbeats which is sufficient for mesh formation.
         await asyncio.sleep(5.0)
 
         # Phase 4: Start node services (validators, chain service, etc).
@@ -453,7 +481,7 @@ class NodeCluster:
         for node in self.nodes:
             await node.start()
 
-    def _distribute_validators(self, num_nodes: int) -> list[list[int]]:
+    def _distribute_validators(self, num_nodes: int) -> list[list[ValidatorIndex]]:
         """
         Distribute validators evenly across nodes.
 
@@ -466,9 +494,9 @@ class NodeCluster:
         if num_nodes == 0:
             return []
 
-        distribution: list[list[int]] = [[] for _ in range(num_nodes)]
+        distribution: list[list[ValidatorIndex]] = [[] for _ in range(num_nodes)]
         for i in range(self.num_validators):
-            distribution[i % num_nodes].append(i)
+            distribution[i % num_nodes].append(ValidatorIndex(i))
 
         return distribution
 
@@ -545,19 +573,33 @@ class NodeCluster:
 
         return False
 
-    def get_multiaddr(self, node_index: int) -> str:
+    def log_diagnostics(self, phase: str) -> list[PipelineDiagnostics]:
         """
-        Get the multiaddr for a node.
+        Snapshot and log pipeline state for every node in the cluster.
+
+        Takes a point-in-time snapshot of each node's consensus pipeline
+        and logs a single summary line per node. Returns the snapshots
+        for use in subsequent assertions.
 
         Args:
-            node_index: Index of the node.
+            phase: Human-readable label for the current test phase (appears in log output).
 
         Returns:
-            Multiaddr string for connecting to the node.
+            One diagnostic snapshot per node, in node index order.
         """
-        if node_index >= len(self.nodes):
-            raise IndexError(f"Node index {node_index} out of range")
-
-        node = self.nodes[node_index]
-        peer_id = node.event_source.connection_manager.peer_id
-        return f"{node.listen_addr}/p2p/{peer_id}"
+        diags = [node.diagnostics() for node in self.nodes]
+        for i, d in enumerate(diags):
+            logger.info(
+                "[%s] Node %d: head=%d safe=%d just=%d fin=%d blocks=%d gsigs=%d nagg=%d kagg=%d",
+                phase,
+                i,
+                d.head_slot,
+                d.safe_target_slot,
+                d.justified_slot,
+                d.finalized_slot,
+                d.block_count,
+                d.gossip_signatures_count,
+                d.new_aggregated_count,
+                d.known_aggregated_count,
+            )
+        return diags

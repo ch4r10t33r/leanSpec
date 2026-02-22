@@ -8,10 +8,12 @@ These constants define pre-defined keys with standard meanings.
 See: https://eips.ethereum.org/EIPS/eip-778
 """
 
+from __future__ import annotations
+
 from typing import Final
 
-EnrKey = str
-"""Type alias for ENR keys (can be any string/bytes per EIP-778)"""
+type EnrKey = str
+"""ENR key identifier (any string/bytes per EIP-778)."""
 
 # EIP-778 Standard Keys
 ID: Final[EnrKey] = "id"

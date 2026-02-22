@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 from typing import (
     IO,
     Any,
@@ -116,11 +115,6 @@ class SSZUnion(SSZModel):
         return self.OPTIONS[self.selector]
 
     @classmethod
-    def options(cls) -> tuple[type[SSZType] | None, ...]:
-        """Get the tuple of possible types for this Union."""
-        return cls.OPTIONS
-
-    @classmethod
     def is_fixed_size(cls) -> bool:
         """Union types are always variable-size in SSZ."""
         return False
@@ -171,7 +165,7 @@ class SSZUnion(SSZModel):
             return cls(selector=selector, value=None)
 
         # Handle non-None option
-        if selected_type.is_fixed_size() and hasattr(selected_type, "get_byte_length"):
+        if selected_type.is_fixed_size():
             required_bytes = selected_type.get_byte_length()
             if remaining_bytes < required_bytes:
                 raise SSZSerializationError(
@@ -186,17 +180,6 @@ class SSZUnion(SSZModel):
             raise SSZSerializationError(
                 f"{cls.__name__}: failed to deserialize {selected_type.__name__}: {e}"
             ) from e
-
-    def encode_bytes(self) -> bytes:
-        """Encode this Union to bytes."""
-        with io.BytesIO() as stream:
-            self.serialize(stream)
-            return stream.getvalue()
-
-    @classmethod
-    def decode_bytes(cls, data: bytes) -> Self:
-        """Decode a Union from bytes."""
-        return cls.deserialize(io.BytesIO(data), len(data))
 
     def __repr__(self) -> str:
         """Return a readable string representation of this Union."""

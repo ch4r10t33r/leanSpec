@@ -1,13 +1,16 @@
 """Tests for minimal peer module."""
 
-from typing import TYPE_CHECKING
+import time
 
+from lean_spec.subspecs.containers.checkpoint import Checkpoint
+from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.subspecs.networking import PeerId
-from lean_spec.subspecs.networking.peer import Direction, PeerInfo
-from lean_spec.subspecs.networking.types import ConnectionState, GoodbyeReason
-
-if TYPE_CHECKING:
-    from lean_spec.subspecs.networking.enr import ENR
+from lean_spec.subspecs.networking.enr import ENR
+from lean_spec.subspecs.networking.enr.eth2 import FAR_FUTURE_EPOCH
+from lean_spec.subspecs.networking.peer import PeerInfo
+from lean_spec.subspecs.networking.reqresp import Status
+from lean_spec.subspecs.networking.types import ConnectionState, Direction, SeqNumber
+from lean_spec.types import Bytes32, Bytes64
 
 
 def peer(name: str) -> PeerId:
@@ -24,16 +27,6 @@ class TestConnectionState:
         assert ConnectionState.CONNECTING == 2
         assert ConnectionState.CONNECTED == 3
         assert ConnectionState.DISCONNECTING == 4
-
-
-class TestGoodbyeReason:
-    """Tests for GoodbyeReason codes."""
-
-    def test_official_codes(self) -> None:
-        """Official spec codes have correct values."""
-        assert GoodbyeReason.CLIENT_SHUTDOWN == 1
-        assert GoodbyeReason.IRRELEVANT_NETWORK == 2
-        assert GoodbyeReason.FAULT_OR_ERROR == 3
 
 
 class TestDirection:
@@ -63,11 +56,11 @@ class TestPeerInfo:
             peer_id=peer("16Uiu2HAk"),
             state=ConnectionState.CONNECTED,
             direction=Direction.INBOUND,
-            address="/ip4/192.168.1.1/tcp/9000",
+            address="/ip4/192.168.1.1/udp/9000/quic-v1",
         )
         assert info.state == ConnectionState.CONNECTED
         assert info.direction == Direction.INBOUND
-        assert info.address == "/ip4/192.168.1.1/tcp/9000"
+        assert info.address == "/ip4/192.168.1.1/udp/9000/quic-v1"
 
     def test_is_connected(self) -> None:
         """is_connected() returns True only when connected."""
@@ -91,8 +84,6 @@ class TestPeerInfo:
         original_time = info.last_seen
 
         # Small delay to ensure time difference
-        import time
-
         time.sleep(0.01)
 
         info.update_last_seen()
@@ -102,19 +93,15 @@ class TestPeerInfo:
 class TestPeerInfoForkDigest:
     """Tests for PeerInfo fork_digest property."""
 
-    def _make_enr_with_eth2(self, fork_digest_bytes: bytes) -> "ENR":
+    def _make_enr_with_eth2(self, fork_digest_bytes: bytes) -> ENR:
         """Create a minimal ENR with eth2 data for testing."""
-        from lean_spec.subspecs.networking.enr import ENR
-        from lean_spec.subspecs.networking.enr.eth2 import FAR_FUTURE_EPOCH
-        from lean_spec.types import Bytes64, Uint64
-
         # Create eth2 bytes: fork_digest(4) + next_fork_version(4) + next_fork_epoch(8)
         eth2_bytes = (
             fork_digest_bytes + fork_digest_bytes + int(FAR_FUTURE_EPOCH).to_bytes(8, "little")
         )
         return ENR(
             signature=Bytes64(b"\x00" * 64),
-            seq=Uint64(1),
+            seq=SeqNumber(1),
             pairs={"eth2": eth2_bytes, "id": b"v4"},
         )
 
@@ -125,13 +112,10 @@ class TestPeerInfoForkDigest:
 
     def test_fork_digest_none_without_eth2(self) -> None:
         """fork_digest returns None when ENR has no eth2 data."""
-        from lean_spec.subspecs.networking.enr import ENR
-        from lean_spec.types import Bytes64, Uint64
-
         # ENR without eth2 key
         enr = ENR(
             signature=Bytes64(b"\x00" * 64),
-            seq=Uint64(1),
+            seq=SeqNumber(1),
             pairs={"id": b"v4"},
         )
         info = PeerInfo(peer_id=peer("test"), enr=enr)
@@ -153,11 +137,6 @@ class TestPeerInfoForkDigest:
 
     def test_status_can_be_set(self) -> None:
         """Test that status can be set and read back."""
-        from lean_spec.subspecs.containers.checkpoint import Checkpoint
-        from lean_spec.subspecs.containers.slot import Slot
-        from lean_spec.subspecs.networking.reqresp import Status
-        from lean_spec.types import Bytes32
-
         info = PeerInfo(peer_id=peer("test"))
 
         # Create a test status
@@ -175,8 +154,6 @@ class TestPeerInfoForkDigest:
 
     def test_update_last_seen_updates_timestamp(self) -> None:
         """Test that update_last_seen updates the last_seen timestamp."""
-        import time
-
         info = PeerInfo(peer_id=peer("test"))
         original_time = info.last_seen
 

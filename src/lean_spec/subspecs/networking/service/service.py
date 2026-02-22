@@ -26,18 +26,20 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from lean_spec.snappy import frame_compress
+from lean_spec.snappy import compress
 from lean_spec.subspecs.containers import SignedBlockWithAttestation
-from lean_spec.subspecs.containers.attestation import SignedAttestation
+from lean_spec.subspecs.containers.attestation import SignedAggregatedAttestation, SignedAttestation
+from lean_spec.subspecs.containers.validator import SubnetId
+from lean_spec.subspecs.networking.client.event_source import EventSource
 from lean_spec.subspecs.networking.gossipsub.topic import GossipTopic
-from lean_spec.subspecs.networking.peer.info import PeerInfo
+from lean_spec.subspecs.networking.peer import PeerInfo
 from lean_spec.subspecs.networking.types import ConnectionState
 
 from .events import (
+    GossipAggregatedAttestationEvent,
     GossipAttestationEvent,
     GossipBlockEvent,
     NetworkEvent,
-    NetworkEventSource,
     PeerConnectedEvent,
     PeerDisconnectedEvent,
     PeerStatusEvent,
@@ -69,8 +71,8 @@ class NetworkService:
     sync_service: SyncService
     """Sync service that receives routed events."""
 
-    event_source: NetworkEventSource
-    """Source of network events (libp2p wrapper or test mock)."""
+    event_source: EventSource
+    """Source of network events from the transport layer."""
 
     fork_digest: str = field(default="0x00000000")
     """Fork digest for gossip topics (4-byte hex string)."""
@@ -80,9 +82,6 @@ class NetworkService:
 
     _running: bool = field(default=False, repr=False)
     """Whether the event loop is running."""
-
-    _events_processed: int = field(default=0, repr=False)
-    """Counter for processed events (for monitoring)."""
 
     async def run(self) -> None:
         """
@@ -107,7 +106,6 @@ class NetworkService:
                     break
 
                 await self._handle_event(event)
-                self._events_processed += 1
 
         except StopAsyncIteration:
             # Source exhausted - normal termination for finite event sources.
@@ -146,13 +144,17 @@ class NetworkService:
                 )
                 await self.sync_service.on_gossip_block(block, peer_id)
 
-            case GossipAttestationEvent(attestation=attestation, peer_id=peer_id):
+            case GossipAttestationEvent(attestation=attestation):
                 #
                 # SyncService will validate signature and update forkchoice.
-                await self.sync_service.on_gossip_attestation(
-                    attestation=attestation,
-                    peer_id=peer_id,
-                )
+                await self.sync_service.on_gossip_attestation(attestation)
+
+            case GossipAggregatedAttestationEvent(signed_attestation=att):
+                # Route aggregated attestations to sync service.
+                #
+                # Aggregates contain multiple validator votes and are used
+                # to advance justification and finalization.
+                await self.sync_service.on_gossip_aggregated_attestation(att)
 
             case PeerStatusEvent(peer_id=peer_id, status=status):
                 # Route peer status updates to sync service.
@@ -195,11 +197,6 @@ class NetworkService:
         """Check if the event loop is currently running."""
         return self._running
 
-    @property
-    def events_processed(self) -> int:
-        """Total events processed since creation."""
-        return self._events_processed
-
     async def publish_block(self, block: SignedBlockWithAttestation) -> None:
         """
         Publish a block to the gossip network.
@@ -212,12 +209,14 @@ class NetworkService:
         """
         topic = GossipTopic.block(self.fork_digest)
         ssz_bytes = block.encode_bytes()
-        compressed = frame_compress(ssz_bytes)
+        compressed = compress(ssz_bytes)
 
         await self.event_source.publish(str(topic), compressed)
         logger.debug("Published block at slot %s", block.message.block.slot)
 
-    async def publish_attestation(self, attestation: SignedAttestation, subnet_id: int) -> None:
+    async def publish_attestation(
+        self, attestation: SignedAttestation, subnet_id: SubnetId
+    ) -> None:
         """
         Publish an attestation to the attestation subnet gossip topic.
 
@@ -230,7 +229,23 @@ class NetworkService:
         """
         topic = GossipTopic.attestation_subnet(self.fork_digest, subnet_id)
         ssz_bytes = attestation.encode_bytes()
-        compressed = frame_compress(ssz_bytes)
+        compressed = compress(ssz_bytes)
 
         await self.event_source.publish(str(topic), compressed)
-        logger.debug("Published attestation for slot %s", attestation.message.slot)
+        logger.debug("Published attestation for slot %s", attestation.data.slot)
+
+    async def publish_aggregated_attestation(
+        self, signed_attestation: SignedAggregatedAttestation
+    ) -> None:
+        """
+        Publish an aggregated attestation to the aggregation gossip topic.
+
+        Args:
+            signed_attestation: Aggregated attestation to publish.
+        """
+        topic = GossipTopic.committee_aggregation(self.fork_digest)
+        ssz_bytes = signed_attestation.encode_bytes()
+        compressed = compress(ssz_bytes)
+
+        await self.event_source.publish(str(topic), compressed)
+        logger.debug("Published aggregated attestation for slot %s", signed_attestation.data.slot)

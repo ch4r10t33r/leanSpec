@@ -4,13 +4,16 @@ import pytest
 
 from lean_spec.subspecs.networking.discovery.codec import (
     MessageDecodingError,
+    MessageEncodingError,
+    _decode_request_id,
     decode_message,
     encode_message,
-    generate_request_id,
 )
 from lean_spec.subspecs.networking.discovery.messages import (
     Distance,
     FindNode,
+    IPv4,
+    IPv6,
     MessageType,
     Nodes,
     Ping,
@@ -87,7 +90,7 @@ class TestPongCodec:
         pong = Pong(
             request_id=RequestId(data=b"\x01\x02\x03"),
             enr_seq=SeqNumber(42),
-            recipient_ip=b"\x7f\x00\x00\x01",  # 127.0.0.1
+            recipient_ip=IPv4(b"\x7f\x00\x00\x01"),  # 127.0.0.1
             recipient_port=Port(9000),
         )
 
@@ -105,7 +108,7 @@ class TestPongCodec:
         pong = Pong(
             request_id=RequestId(data=b"\x01"),
             enr_seq=SeqNumber(1),
-            recipient_ip=bytes(16),  # ::0
+            recipient_ip=IPv6(bytes(16)),  # ::0
             recipient_port=Port(9000),
         )
 
@@ -113,7 +116,7 @@ class TestPongCodec:
         decoded = decode_message(encoded)
 
         assert isinstance(decoded, Pong)
-        assert decoded.recipient_ip == bytes(16)
+        assert decoded.recipient_ip == IPv6(bytes(16))
 
 
 class TestFindNodeCodec:
@@ -310,24 +313,37 @@ class TestDecodingErrors:
             decode_message(b"\x01\xff\xff")  # PING type + invalid RLP
 
 
+class TestEncodingErrors:
+    """Tests for message encoding error handling."""
+
+    def test_encode_unknown_type_raises(self):
+        """Encoding an unsupported message type raises MessageEncodingError."""
+        with pytest.raises(MessageEncodingError, match="Unknown message type"):
+            encode_message("not_a_message")  # type: ignore[arg-type]
+
+
+class TestRequestIdDecoding:
+    """Tests for request ID decoding edge cases."""
+
+    def test_request_id_too_long_raises(self):
+        """Request ID longer than 8 bytes raises ValueError."""
+        with pytest.raises(ValueError, match="Request ID too long"):
+            _decode_request_id(bytes(9))
+
+
 class TestRequestIdGeneration:
     """Tests for request ID generation."""
 
     def test_generates_8_byte_id(self):
         """Test that generated request ID is 8 bytes."""
-        request_id = generate_request_id()
+        request_id = RequestId.generate()
         assert len(request_id) == 8
 
     def test_generates_different_ids(self):
         """Test that each generation produces a different ID."""
-        id1 = generate_request_id()
-        id2 = generate_request_id()
+        id1 = RequestId.generate()
+        id2 = RequestId.generate()
         assert id1 != id2
-
-
-# ==============================================================================
-# Phase 5: Address Handling Tests
-# ==============================================================================
 
 
 class TestAddressEncoding:
@@ -338,24 +354,24 @@ class TestAddressEncoding:
         pong = Pong(
             request_id=RequestId(data=b"\x01"),
             enr_seq=SeqNumber(1),
-            recipient_ip=b"\x7f\x00\x00\x01",  # 127.0.0.1
+            recipient_ip=IPv4(b"\x7f\x00\x00\x01"),  # 127.0.0.1
             recipient_port=Port(9000),
         )
 
         assert len(pong.recipient_ip) == 4
-        assert pong.recipient_ip == b"\x7f\x00\x00\x01"
+        assert pong.recipient_ip == IPv4(b"\x7f\x00\x00\x01")
 
         # Encode and decode roundtrip.
         encoded = encode_message(pong)
         decoded = decode_message(encoded)
 
         assert isinstance(decoded, Pong)
-        assert decoded.recipient_ip == b"\x7f\x00\x00\x01"
+        assert decoded.recipient_ip == IPv4(b"\x7f\x00\x00\x01")
 
     def test_pong_ipv6_16_bytes(self):
         """PONG encodes IPv6 as 16 bytes."""
         # IPv6 loopback ::1
-        ipv6_loopback = bytes(15) + b"\x01"
+        ipv6_loopback = IPv6(bytes(15) + b"\x01")
 
         pong = Pong(
             request_id=RequestId(data=b"\x01"),
@@ -376,10 +392,10 @@ class TestAddressEncoding:
     def test_pong_common_ipv4_addresses(self):
         """Common IPv4 addresses encode correctly."""
         test_addresses = [
-            (b"\x00\x00\x00\x00", "0.0.0.0"),
-            (b"\x7f\x00\x00\x01", "127.0.0.1"),
-            (b"\xc0\xa8\x01\x01", "192.168.1.1"),
-            (b"\xff\xff\xff\xff", "255.255.255.255"),
+            (IPv4(b"\x00\x00\x00\x00"), "0.0.0.0"),
+            (IPv4(b"\x7f\x00\x00\x01"), "127.0.0.1"),
+            (IPv4(b"\xc0\xa8\x01\x01"), "192.168.1.1"),
+            (IPv4(b"\xff\xff\xff\xff"), "255.255.255.255"),
         ]
 
         for ip_bytes, _ in test_addresses:
@@ -399,13 +415,13 @@ class TestAddressEncoding:
     def test_pong_common_ipv6_addresses(self):
         """Common IPv6 addresses encode correctly."""
         # ::1 (loopback)
-        ipv6_loopback = bytes(15) + b"\x01"
+        ipv6_loopback = IPv6(bytes(15) + b"\x01")
 
         # fe80::1 (link-local)
-        ipv6_link_local = b"\xfe\x80" + bytes(13) + b"\x01"
+        ipv6_link_local = IPv6(b"\xfe\x80" + bytes(13) + b"\x01")
 
         test_addresses = [
-            bytes(16),  # ::
+            IPv6(bytes(16)),  # ::
             ipv6_loopback,  # ::1
             ipv6_link_local,  # fe80::1
         ]
@@ -443,7 +459,7 @@ class TestPortEncoding:
             pong = Pong(
                 request_id=RequestId(data=b"\x01"),
                 enr_seq=SeqNumber(1),
-                recipient_ip=b"\x7f\x00\x00\x01",
+                recipient_ip=IPv4(b"\x7f\x00\x00\x01"),
                 recipient_port=Port(port_value),
             )
 
@@ -459,7 +475,7 @@ class TestPortEncoding:
         pong_min = Pong(
             request_id=RequestId(data=b"\x01"),
             enr_seq=SeqNumber(1),
-            recipient_ip=b"\x7f\x00\x00\x01",
+            recipient_ip=IPv4(b"\x7f\x00\x00\x01"),
             recipient_port=Port(0),
         )
 
@@ -472,7 +488,7 @@ class TestPortEncoding:
         pong_max = Pong(
             request_id=RequestId(data=b"\x01"),
             enr_seq=SeqNumber(1),
-            recipient_ip=b"\x7f\x00\x00\x01",
+            recipient_ip=IPv4(b"\x7f\x00\x00\x01"),
             recipient_port=Port(65535),
         )
 

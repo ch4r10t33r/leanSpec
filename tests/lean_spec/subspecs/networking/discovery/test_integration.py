@@ -6,6 +6,8 @@ Tests full protocol flows between components.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from lean_spec.subspecs.networking.discovery.codec import (
@@ -19,13 +21,9 @@ from lean_spec.subspecs.networking.discovery.crypto import (
 from lean_spec.subspecs.networking.discovery.handshake import HandshakeManager
 from lean_spec.subspecs.networking.discovery.keys import compute_node_id, derive_keys_from_pubkey
 from lean_spec.subspecs.networking.discovery.messages import (
-    FindNode,
-    MessageType,
-    Nodes,
+    Nonce,
     PacketFlag,
     Ping,
-    Pong,
-    Port,
     RequestId,
 )
 from lean_spec.subspecs.networking.discovery.packet import (
@@ -35,7 +33,6 @@ from lean_spec.subspecs.networking.discovery.packet import (
     decode_whoareyou_authdata,
     encode_message_authdata,
     encode_packet,
-    generate_nonce,
 )
 from lean_spec.subspecs.networking.discovery.routing import (
     NodeEntry,
@@ -44,7 +41,7 @@ from lean_spec.subspecs.networking.discovery.routing import (
 from lean_spec.subspecs.networking.discovery.session import Session, SessionCache
 from lean_spec.subspecs.networking.enr import ENR
 from lean_spec.subspecs.networking.types import NodeId, SeqNumber
-from lean_spec.types import Bytes64, Uint64
+from lean_spec.types import Bytes12, Bytes16, Bytes64
 
 
 @pytest.fixture
@@ -52,7 +49,7 @@ def node_a_keys():
     """Node A's keypair."""
     priv, pub = generate_secp256k1_keypair()
     node_id = compute_node_id(pub)
-    return {"private_key": priv, "public_key": pub, "node_id": bytes(node_id)}
+    return {"private_key": priv, "public_key": pub, "node_id": NodeId(node_id)}
 
 
 @pytest.fixture
@@ -60,80 +57,7 @@ def node_b_keys():
     """Node B's keypair."""
     priv, pub = generate_secp256k1_keypair()
     node_id = compute_node_id(pub)
-    return {"private_key": priv, "public_key": pub, "node_id": bytes(node_id)}
-
-
-class TestMessageRoundtrip:
-    """Test encoding/decoding of all message types."""
-
-    def test_ping_roundtrip(self):
-        """PING message encodes and decodes correctly."""
-        original = Ping(
-            request_id=RequestId(data=b"\x01\x02\x03"),
-            enr_seq=Uint64(42),
-        )
-
-        encoded = encode_message(original)
-        assert encoded[0] == MessageType.PING
-
-        decoded = decode_message(encoded)
-        assert isinstance(decoded, Ping)
-        assert bytes(decoded.request_id) == b"\x01\x02\x03"
-        assert int(decoded.enr_seq) == 42
-
-    def test_pong_roundtrip(self):
-        """PONG message encodes and decodes correctly."""
-        original = Pong(
-            request_id=RequestId(data=b"\x01\x02\x03"),
-            enr_seq=Uint64(42),
-            recipient_ip=bytes([127, 0, 0, 1]),
-            recipient_port=Port(9000),
-        )
-
-        encoded = encode_message(original)
-        decoded = decode_message(encoded)
-
-        assert isinstance(decoded, Pong)
-        assert decoded.recipient_ip == bytes([127, 0, 0, 1])
-        assert int(decoded.recipient_port) == 9000
-
-    def test_findnode_roundtrip(self):
-        """FINDNODE message encodes and decodes correctly."""
-        from lean_spec.subspecs.networking.discovery.messages import Distance
-
-        original = FindNode(
-            request_id=RequestId(data=b"\x01\x02\x03"),
-            distances=[Distance(128), Distance(256)],
-        )
-
-        encoded = encode_message(original)
-        decoded = decode_message(encoded)
-
-        assert isinstance(decoded, FindNode)
-        assert len(decoded.distances) == 2
-
-    def test_nodes_roundtrip(self):
-        """NODES message encodes and decodes correctly."""
-        # Create a minimal ENR for testing.
-        enr = ENR(
-            signature=Bytes64(bytes(64)),
-            seq=Uint64(1),
-            pairs={"id": b"v4"},
-        )
-
-        from lean_spec.types.uint import Uint8
-
-        original = Nodes(
-            request_id=RequestId(data=b"\x01\x02\x03"),
-            total=Uint8(1),
-            enrs=[enr.to_rlp()],
-        )
-
-        encoded = encode_message(original)
-        decoded = decode_message(encoded)
-
-        assert isinstance(decoded, Nodes)
-        assert len(decoded.enrs) == 1
+    return {"private_key": priv, "public_key": pub, "node_id": NodeId(node_id)}
 
 
 class TestEncryptedPacketRoundtrip:
@@ -143,7 +67,7 @@ class TestEncryptedPacketRoundtrip:
         """MESSAGE packet encrypts and decrypts correctly."""
         # Build mock challenge_data for key derivation.
         # Format: masking-iv (16) + static-header (23) + authdata (24) = 63 bytes.
-        masking_iv = bytes(16)
+        masking_iv = Bytes16(bytes(16))
         static_header = b"discv5" + b"\x00\x01\x01" + bytes(12) + b"\x00\x18"
         authdata = bytes(24)
         challenge_data = masking_iv + static_header + authdata
@@ -162,27 +86,26 @@ class TestEncryptedPacketRoundtrip:
         # Create a PING message.
         ping = Ping(
             request_id=RequestId(data=b"\x01"),
-            enr_seq=Uint64(1),
+            enr_seq=SeqNumber(1),
         )
         message_bytes = encode_message(ping)
 
         # Create authdata.
         authdata = encode_message_authdata(node_a_keys["node_id"])
-        nonce = generate_nonce()
+        nonce = Nonce.generate()
 
         # Encode packet.
         packet = encode_packet(
             dest_node_id=node_b_keys["node_id"],
-            src_node_id=node_a_keys["node_id"],
             flag=PacketFlag.MESSAGE,
-            nonce=bytes(nonce),
+            nonce=nonce,
             authdata=authdata,
             message=message_bytes,
             encryption_key=send_key,
         )
 
         # Decode header.
-        header, ciphertext = decode_packet_header(node_b_keys["node_id"], packet)
+        header, ciphertext, message_ad = decode_packet_header(node_b_keys["node_id"], packet)
 
         assert header.flag == PacketFlag.MESSAGE
 
@@ -200,11 +123,11 @@ class TestEncryptedPacketRoundtrip:
             is_initiator=False,
         )
 
-        # Extract masked header for AAD.
-        masked_header = packet[16 : 16 + 23 + len(header.authdata)]
-
         # Node B uses recv_key to decrypt (which equals Node A's send_key).
-        plaintext = aes_gcm_decrypt(b_recv_key, bytes(header.nonce), ciphertext, masked_header)
+        # message_ad = masking-iv || plaintext header (per spec).
+        plaintext = aes_gcm_decrypt(
+            Bytes16(b_recv_key), Bytes12(header.nonce), ciphertext, message_ad
+        )
 
         # Decode message.
         decoded_ping = decode_message(plaintext)
@@ -217,15 +140,13 @@ class TestSessionEstablishment:
 
     def test_session_cache_operations(self, node_a_keys, node_b_keys):
         """Session cache stores and retrieves sessions."""
-        import time
-
         cache = SessionCache()
 
         now = time.time()
         session = Session(
             node_id=node_b_keys["node_id"],
-            send_key=bytes(16),
-            recv_key=bytes(16),
+            send_key=Bytes16(bytes(16)),
+            recv_key=Bytes16(bytes(16)),
             created_at=now,
             last_seen=now,
             is_initiator=True,
@@ -242,34 +163,7 @@ class TestSessionEstablishment:
         assert retrieved is not None
         assert retrieved.node_id == node_b_keys["node_id"]
 
-    def test_session_cache_eviction(self, node_a_keys):
-        """Session cache evicts old sessions when full."""
-        import time
-
-        cache = SessionCache(max_sessions=3)
-
-        # Add 4 sessions.
-        for i in range(4):
-            node_id = bytes([i]) + bytes(31)
-            now = time.time()
-            session = Session(
-                node_id=node_id,
-                send_key=bytes(16),
-                recv_key=bytes(16),
-                created_at=now,
-                last_seen=now,
-                is_initiator=True,
-            )
-            cache.create(
-                node_id=session.node_id,
-                send_key=session.send_key,
-                recv_key=session.recv_key,
-                is_initiator=session.is_initiator,
-            )
-
-        # Oldest should be evicted.
-        assert cache.get(bytes([0]) + bytes(31)) is None
-        assert cache.get(bytes([3]) + bytes(31)) is not None
+    # Session cache eviction is tested in test_session.py TestSessionCache.test_eviction_when_full
 
 
 class TestRoutingTableIntegration:
@@ -324,7 +218,7 @@ class TestHandshakeManagerIntegration:
         cache = SessionCache()
         enr = ENR(
             signature=Bytes64(bytes(64)),
-            seq=Uint64(1),
+            seq=SeqNumber(1),
             pairs={"id": b"v4"},
         )
 
@@ -332,17 +226,17 @@ class TestHandshakeManagerIntegration:
             local_node_id=node_a_keys["node_id"],
             local_private_key=node_a_keys["private_key"],
             local_enr_rlp=enr.to_rlp(),
-            local_enr_seq=1,
+            local_enr_seq=SeqNumber(1),
             session_cache=cache,
         )
 
         # Create WHOAREYOU.
-        request_nonce = bytes(12)
-        masking_iv = bytes(16)
+        request_nonce = Nonce(bytes(12))
+        masking_iv = Bytes16(bytes(16))
         id_nonce, authdata, nonce, challenge_data = manager.create_whoareyou(
             remote_node_id=node_b_keys["node_id"],
             request_nonce=request_nonce,
-            remote_enr_seq=0,
+            remote_enr_seq=SeqNumber(0),
             masking_iv=masking_iv,
         )
 
@@ -358,7 +252,7 @@ class TestHandshakeManagerIntegration:
         cache = SessionCache()
         enr = ENR(
             signature=Bytes64(bytes(64)),
-            seq=Uint64(1),
+            seq=SeqNumber(1),
             pairs={"id": b"v4"},
         )
 
@@ -366,7 +260,7 @@ class TestHandshakeManagerIntegration:
             local_node_id=node_a_keys["node_id"],
             local_private_key=node_a_keys["private_key"],
             local_enr_rlp=enr.to_rlp(),
-            local_enr_seq=1,
+            local_enr_seq=SeqNumber(1),
             session_cache=cache,
         )
 
@@ -404,12 +298,12 @@ class TestFullHandshakeFlow:
 
         enr_a = ENR(
             signature=Bytes64(bytes(64)),
-            seq=Uint64(1),
+            seq=SeqNumber(1),
             pairs={"id": b"v4", "secp256k1": node_a_keys["public_key"]},
         )
         enr_b = ENR(
             signature=Bytes64(bytes(64)),
-            seq=Uint64(1),
+            seq=SeqNumber(1),
             pairs={"id": b"v4", "secp256k1": node_b_keys["public_key"]},
         )
 
@@ -417,7 +311,7 @@ class TestFullHandshakeFlow:
             local_node_id=node_a_keys["node_id"],
             local_private_key=node_a_keys["private_key"],
             local_enr_rlp=enr_a.to_rlp(),
-            local_enr_seq=1,
+            local_enr_seq=SeqNumber(1),
             session_cache=cache_a,
         )
 
@@ -425,7 +319,7 @@ class TestFullHandshakeFlow:
             local_node_id=node_b_keys["node_id"],
             local_private_key=node_b_keys["private_key"],
             local_enr_rlp=enr_b.to_rlp(),
-            local_enr_seq=1,
+            local_enr_seq=SeqNumber(1),
             session_cache=cache_b,
         )
 
@@ -433,12 +327,12 @@ class TestFullHandshakeFlow:
         manager_a.start_handshake(node_b_keys["node_id"])
 
         # Step 2: Node B creates WHOAREYOU.
-        request_nonce = bytes(12)
-        masking_iv = bytes(16)
+        request_nonce = Nonce(bytes(12))
+        masking_iv = Bytes16(bytes(16))
         id_nonce, whoareyou_authdata, _, challenge_data = manager_b.create_whoareyou(
             remote_node_id=node_a_keys["node_id"],
             request_nonce=request_nonce,
-            remote_enr_seq=0,
+            remote_enr_seq=SeqNumber(0),
             masking_iv=masking_iv,
         )
 
@@ -474,6 +368,7 @@ class TestFullHandshakeFlow:
         assert len(result.session.send_key) == 16
         assert len(result.session.recv_key) == 16
 
-        # Both sides now have valid session keys.
-        # The exact key matching depends on both sides using the same
-        # id_nonce and ephemeral keys, which is verified in lower-level tests.
+        # Cross-key verification: A's send_key must equal B's recv_key and vice versa.
+        # This confirms both sides derived compatible session keys from the handshake.
+        assert send_key == result.session.recv_key
+        assert recv_key == result.session.send_key

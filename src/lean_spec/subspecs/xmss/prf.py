@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from typing import Final
 
 from pydantic import model_validator
 
@@ -26,26 +27,7 @@ from .constants import (
 )
 from .types import HashDigestVector, PRFKey, Randomness
 
-PRF_DOMAIN_SEP: bytes = bytes(
-    [
-        0xAE,
-        0xAE,
-        0x22,
-        0xFF,
-        0x00,
-        0x01,
-        0xFA,
-        0xFF,
-        0x21,
-        0xAF,
-        0x12,
-        0x00,
-        0x01,
-        0x11,
-        0xFF,
-        0x00,
-    ]
-)
+PRF_DOMAIN_SEP: Final[bytes] = b"\xae\xae\x22\xff\x00\x01\xfa\xff\x21\xaf\x12\x00\x01\x11\xff\x00"
 """
 A 16-byte domain separator to ensure PRF outputs are unique to this context.
 
@@ -53,7 +35,7 @@ This prevents any potential conflicts if the same underlying hash function
 (SHAKE128) were used for other purposes in the system.
 """
 
-PRF_DOMAIN_SEP_DOMAIN_ELEMENT: bytes = bytes([0x00])
+PRF_DOMAIN_SEP_DOMAIN_ELEMENT: Final[bytes] = b"\x00"
 """
 A 1-byte domain separator for deriving domain elements (used in `apply`).
 
@@ -61,7 +43,7 @@ This distinguishes the PRF calls for generating hash chain starting points
 from the PRF calls for generating randomness during signing.
 """
 
-PRF_DOMAIN_SEP_RANDOMNESS: bytes = bytes([0x01])
+PRF_DOMAIN_SEP_RANDOMNESS: Final[bytes] = b"\x01"
 """
 A 1-byte domain separator for deriving randomness (used in `get_randomness`).
 
@@ -70,7 +52,7 @@ PRF calls for generating domain elements, preventing any potential collisions
 between the two use cases.
 """
 
-PRF_BYTES_PER_FE: int = 8
+PRF_BYTES_PER_FE: Final[int] = 8
 """
 The number of bytes of SHAKE128 output used to generate one field element.
 
@@ -110,7 +92,7 @@ class Prf(StrictBaseModel):
     """Configuration parameters for the PRF."""
 
     @model_validator(mode="after")
-    def _validate_strict_types(self) -> "Prf":
+    def _validate_strict_types(self) -> Prf:
         """Reject subclasses to prevent type confusion attacks."""
         enforce_strict_types(self, config=XmssConfig)
         return self
@@ -164,7 +146,7 @@ class Prf(StrictBaseModel):
             PRF_DOMAIN_SEP
             + PRF_DOMAIN_SEP_DOMAIN_ELEMENT
             + key
-            + int(epoch).to_bytes(4, "big")
+            + epoch.to_bytes(4, "big")
             + chain_index.to_bytes(8, "big")
         )
 
@@ -222,9 +204,9 @@ class Prf(StrictBaseModel):
             PRF_DOMAIN_SEP
             + PRF_DOMAIN_SEP_RANDOMNESS
             + key
-            + int(epoch).to_bytes(4, "big")
+            + epoch.to_bytes(4, "big")
             + message
-            + int(counter).to_bytes(8, "big")
+            + counter.to_bytes(8, "big")
         )
 
         # Extract enough bytes for RAND_LEN_FE field elements

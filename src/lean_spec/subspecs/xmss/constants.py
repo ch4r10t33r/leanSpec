@@ -9,6 +9,8 @@ instantiation from the canonical Rust implementation
 We also provide a test instantiation for testing purposes.
 """
 
+from __future__ import annotations
+
 from typing import Final
 
 from lean_spec.config import LEAN_ENV
@@ -31,7 +33,7 @@ class XmssConfig(StrictBaseModel):
     @property
     def LIFETIME(self) -> Uint64:  # noqa: N802
         """
-        The maximum number of epochs supported by this configuration.
+        The maximum number of slots supported by this configuration.
 
         An individual key pair can be active for a smaller sub-range.
         """
@@ -163,7 +165,7 @@ TWEAK_PREFIX_TREE: Final = Fp(value=0x01)
 TWEAK_PREFIX_MESSAGE: Final = Fp(value=0x02)
 """The unique prefix for tweaks used in the initial message hashing step."""
 
-PRF_KEY_LENGTH: int = 32
+PRF_KEY_LENGTH: Final = 32
 """The length of the PRF secret key in bytes."""
 
 _LEAN_ENV_TO_CONFIG = {

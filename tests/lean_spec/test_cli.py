@@ -6,7 +6,6 @@ used by the CLI.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from unittest.mock import AsyncMock, patch
 
@@ -16,13 +15,20 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed, decode_dss_signature
 
-from lean_spec.__main__ import create_anchor_block, is_enr_string, resolve_bootnode
+from lean_spec.__main__ import (
+    _init_from_checkpoint,
+    create_anchor_block,
+    resolve_bootnode,
+)
 from lean_spec.subspecs.containers import Block, BlockBody
 from lean_spec.subspecs.containers.block.types import AggregatedAttestations
 from lean_spec.subspecs.containers.slot import Slot
+from lean_spec.subspecs.genesis import GenesisConfig
+from lean_spec.subspecs.node import Node
 from lean_spec.subspecs.ssz.hash import hash_tree_root
+from lean_spec.subspecs.sync.checkpoint_sync import CheckpointSyncError
 from lean_spec.types import Bytes32, Uint64
-from lean_spec.types.rlp import encode_rlp
+from lean_spec.types.rlp import RLPItem, encode_rlp
 from tests.lean_spec.helpers import make_genesis_state
 
 # Generate a test keypair once for all ENR tests.
@@ -34,7 +40,7 @@ _TEST_COMPRESSED_PUBKEY = _TEST_PUBLIC_KEY.public_bytes(
 )
 
 
-def _sign_enr_content(content_items: list[bytes]) -> bytes:
+def _sign_enr_content(content_items: list[RLPItem]) -> bytes:
     """Sign ENR content and return 64-byte r||s signature."""
     content_rlp = encode_rlp(content_items)
 
@@ -50,7 +56,7 @@ def _sign_enr_content(content_items: list[bytes]) -> bytes:
 def _make_enr_with_udp(ip_bytes: bytes, udp_port: int) -> str:
     """Create a properly signed ENR string with IPv4 and UDP port."""
     # Content items (keys must be sorted).
-    content_items: list[bytes] = [
+    content_items: list[RLPItem] = [
         b"\x01",  # seq = 1
         b"id",
         b"v4",
@@ -70,7 +76,7 @@ def _make_enr_with_udp(ip_bytes: bytes, udp_port: int) -> str:
 
 def _make_enr_with_ipv6_udp(ip6_bytes: bytes, udp_port: int) -> str:
     """Create a properly signed ENR string with IPv6 and UDP port."""
-    content_items: list[bytes] = [
+    content_items: list[RLPItem] = [
         b"\x01",  # seq = 1
         b"id",
         b"v4",
@@ -90,7 +96,7 @@ def _make_enr_with_ipv6_udp(ip6_bytes: bytes, udp_port: int) -> str:
 
 def _make_enr_without_udp(ip_bytes: bytes) -> str:
     """Create a properly signed ENR string with IPv4 but no UDP port."""
-    content_items: list[bytes] = [
+    content_items: list[RLPItem] = [
         b"\x01",  # seq = 1
         b"id",
         b"v4",
@@ -114,48 +120,6 @@ ENR_WITHOUT_UDP = _make_enr_without_udp(b"\xc0\xa8\x01\x01")  # 192.168.1.1, no 
 # Valid multiaddr strings (QUIC format)
 MULTIADDR_IPV4 = "/ip4/127.0.0.1/udp/9000/quic-v1"
 MULTIADDR_IPV6 = "/ip6/::1/udp/9000/quic-v1"
-
-
-class TestIsEnrString:
-    """Tests for is_enr_string() detection function."""
-
-    def test_enr_string_detected(self) -> None:
-        """Valid ENR prefix returns True."""
-        assert is_enr_string("enr:-IS4QHCYrYZbAKW...") is True
-
-    def test_enr_prefix_minimal(self) -> None:
-        """Minimal ENR prefix 'enr:' returns True."""
-        assert is_enr_string("enr:") is True
-
-    def test_enr_with_valid_content(self) -> None:
-        """Full valid ENR string returns True."""
-        assert is_enr_string(ENR_WITH_UDP) is True
-
-    def test_multiaddr_not_detected(self) -> None:
-        """Multiaddr string returns False."""
-        assert is_enr_string(MULTIADDR_IPV4) is False
-        assert is_enr_string(MULTIADDR_IPV6) is False
-
-    def test_empty_string(self) -> None:
-        """Empty string returns False."""
-        assert is_enr_string("") is False
-
-    def test_enode_not_detected(self) -> None:
-        """enode:// format returns False."""
-        enode = "enode://abc123@127.0.0.1:30303"
-        assert is_enr_string(enode) is False
-
-    def test_similar_prefix_not_detected(self) -> None:
-        """Strings with similar but incorrect prefixes return False."""
-        assert is_enr_string("ENR:") is False  # Case sensitive
-        assert is_enr_string("enr") is False  # Missing colon
-        assert is_enr_string("enr-") is False  # Wrong separator
-        assert is_enr_string("enrs:") is False  # Extra character
-
-    def test_whitespace_prefix_not_detected(self) -> None:
-        """Whitespace before prefix returns False."""
-        assert is_enr_string(" enr:abc") is False
-        assert is_enr_string("\tenr:abc") is False
 
 
 class TestResolveBootnode:
@@ -271,11 +235,6 @@ class TestMixedBootnodes:
         assert resolved[1] == "/ip4/192.168.1.1/udp/9000/quic-v1"
 
 
-# =============================================================================
-# Checkpoint Sync Tests
-# =============================================================================
-
-
 class TestCreateAnchorBlock:
     """Tests for create_anchor_block() function."""
 
@@ -357,210 +316,171 @@ class TestCreateAnchorBlock:
 class TestInitFromCheckpoint:
     """Tests for _init_from_checkpoint() async function."""
 
-    def test_checkpoint_sync_genesis_time_mismatch_returns_none(self) -> None:
+    async def test_checkpoint_sync_genesis_time_mismatch_returns_none(self) -> None:
         """Returns None when checkpoint state genesis time differs from local config."""
+        # Arrange: Create checkpoint state with genesis_time=1000
+        checkpoint_state = make_genesis_state(num_validators=3, genesis_time=1000)
 
-        async def run_test() -> None:
-            from lean_spec.__main__ import _init_from_checkpoint
-            from lean_spec.subspecs.genesis import GenesisConfig
+        # Local genesis config with different genesis_time=2000
+        local_genesis = GenesisConfig.model_validate(
+            {
+                "GENESIS_TIME": 2000,
+                "GENESIS_VALIDATORS": [],
+            }
+        )
 
-            # Arrange: Create checkpoint state with genesis_time=1000
-            checkpoint_state = make_genesis_state(num_validators=3, genesis_time=1000)
+        # Mock the checkpoint sync client functions
+        mock_event_source = AsyncMock()
 
-            # Local genesis config with different genesis_time=2000
-            local_genesis = GenesisConfig.model_validate(
-                {
-                    "GENESIS_TIME": 2000,
-                    "GENESIS_VALIDATORS": [],
-                }
+        with (
+            patch(
+                "lean_spec.__main__.fetch_finalized_state",
+                new_callable=AsyncMock,
+                return_value=checkpoint_state,
+            ),
+            patch(
+                "lean_spec.__main__.verify_checkpoint_state",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            # Act
+            result = await _init_from_checkpoint(
+                checkpoint_sync_url="http://localhost:5052",
+                genesis=local_genesis,
+                event_source=mock_event_source,
             )
 
-            # Mock the checkpoint sync client functions
-            mock_event_source = AsyncMock()
+        # Assert: Returns None due to genesis time mismatch
+        assert result is None
 
-            with (
-                patch(
-                    "lean_spec.subspecs.sync.checkpoint_sync.fetch_finalized_state",
-                    new_callable=AsyncMock,
-                    return_value=checkpoint_state,
-                ),
-                patch(
-                    "lean_spec.subspecs.sync.checkpoint_sync.verify_checkpoint_state",
-                    new_callable=AsyncMock,
-                    return_value=True,
-                ),
-            ):
-                # Act
-                result = await _init_from_checkpoint(
-                    checkpoint_sync_url="http://localhost:5052",
-                    genesis=local_genesis,
-                    event_source=mock_event_source,
-                )
-
-            # Assert: Returns None due to genesis time mismatch
-            assert result is None
-
-        asyncio.run(run_test())
-
-    def test_checkpoint_sync_verification_failure_returns_none(self) -> None:
+    async def test_checkpoint_sync_verification_failure_returns_none(self) -> None:
         """Returns None when checkpoint state verification fails."""
+        # Arrange
+        checkpoint_state = make_genesis_state(num_validators=3, genesis_time=1000)
+        local_genesis = GenesisConfig.model_validate(
+            {
+                "GENESIS_TIME": 1000,
+                "GENESIS_VALIDATORS": [],
+            }
+        )
 
-        async def run_test() -> None:
-            from lean_spec.__main__ import _init_from_checkpoint
-            from lean_spec.subspecs.genesis import GenesisConfig
+        mock_event_source = AsyncMock()
 
-            # Arrange
-            checkpoint_state = make_genesis_state(num_validators=3, genesis_time=1000)
-            local_genesis = GenesisConfig.model_validate(
-                {
-                    "GENESIS_TIME": 1000,
-                    "GENESIS_VALIDATORS": [],
-                }
+        with (
+            patch(
+                "lean_spec.__main__.fetch_finalized_state",
+                new_callable=AsyncMock,
+                return_value=checkpoint_state,
+            ),
+            patch(
+                "lean_spec.__main__.verify_checkpoint_state",
+                return_value=False,  # Verification fails
+            ),
+        ):
+            # Act
+            result = await _init_from_checkpoint(
+                checkpoint_sync_url="http://localhost:5052",
+                genesis=local_genesis,
+                event_source=mock_event_source,
             )
 
-            mock_event_source = AsyncMock()
+        # Assert
+        assert result is None
 
-            with (
-                patch(
-                    "lean_spec.subspecs.sync.checkpoint_sync.fetch_finalized_state",
-                    new_callable=AsyncMock,
-                    return_value=checkpoint_state,
-                ),
-                patch(
-                    "lean_spec.subspecs.sync.checkpoint_sync.verify_checkpoint_state",
-                    new_callable=AsyncMock,
-                    return_value=False,  # Verification fails
-                ),
-            ):
-                # Act
-                result = await _init_from_checkpoint(
-                    checkpoint_sync_url="http://localhost:5052",
-                    genesis=local_genesis,
-                    event_source=mock_event_source,
-                )
-
-            # Assert
-            assert result is None
-
-        asyncio.run(run_test())
-
-    def test_checkpoint_sync_network_error_returns_none(self) -> None:
+    async def test_checkpoint_sync_network_error_returns_none(self) -> None:
         """Returns None when network error occurs during fetch."""
+        # Arrange
+        local_genesis = GenesisConfig.model_validate(
+            {
+                "GENESIS_TIME": 1000,
+                "GENESIS_VALIDATORS": [],
+            }
+        )
 
-        async def run_test() -> None:
-            from lean_spec.__main__ import _init_from_checkpoint
-            from lean_spec.subspecs.genesis import GenesisConfig
-            from lean_spec.subspecs.sync.checkpoint_sync import CheckpointSyncError
+        mock_event_source = AsyncMock()
 
-            # Arrange
-            local_genesis = GenesisConfig.model_validate(
-                {
-                    "GENESIS_TIME": 1000,
-                    "GENESIS_VALIDATORS": [],
-                }
+        with patch(
+            "lean_spec.__main__.fetch_finalized_state",
+            new_callable=AsyncMock,
+            side_effect=CheckpointSyncError("Network error: connection refused"),
+        ):
+            # Act
+            result = await _init_from_checkpoint(
+                checkpoint_sync_url="http://localhost:5052",
+                genesis=local_genesis,
+                event_source=mock_event_source,
             )
 
-            mock_event_source = AsyncMock()
+        # Assert
+        assert result is None
 
-            with patch(
-                "lean_spec.subspecs.sync.checkpoint_sync.fetch_finalized_state",
-                new_callable=AsyncMock,
-                side_effect=CheckpointSyncError("Network error: connection refused"),
-            ):
-                # Act
-                result = await _init_from_checkpoint(
-                    checkpoint_sync_url="http://localhost:5052",
-                    genesis=local_genesis,
-                    event_source=mock_event_source,
-                )
-
-            # Assert
-            assert result is None
-
-        asyncio.run(run_test())
-
-    def test_checkpoint_sync_success_returns_node(self) -> None:
+    async def test_checkpoint_sync_success_returns_node(self) -> None:
         """Successful checkpoint sync returns initialized Node."""
+        # Arrange: Create matching genesis times
+        genesis_time = 1000
+        checkpoint_state = make_genesis_state(num_validators=3, genesis_time=genesis_time)
 
-        async def run_test() -> None:
-            from lean_spec.__main__ import _init_from_checkpoint
-            from lean_spec.subspecs.genesis import GenesisConfig
-            from lean_spec.subspecs.node import Node
+        local_genesis = GenesisConfig.model_validate(
+            {
+                "GENESIS_TIME": genesis_time,
+                "GENESIS_VALIDATORS": [],
+            }
+        )
 
-            # Arrange: Create matching genesis times
-            genesis_time = 1000
-            checkpoint_state = make_genesis_state(num_validators=3, genesis_time=genesis_time)
+        # Create a mock event source with required attributes
+        mock_event_source = AsyncMock()
+        mock_event_source.reqresp_client = AsyncMock()
 
-            local_genesis = GenesisConfig.model_validate(
-                {
-                    "GENESIS_TIME": genesis_time,
-                    "GENESIS_VALIDATORS": [],
-                }
-            )
-
-            # Create a mock event source with required attributes
-            mock_event_source = AsyncMock()
-            mock_event_source.reqresp_client = AsyncMock()
-
-            with (
-                patch(
-                    "lean_spec.subspecs.sync.checkpoint_sync.fetch_finalized_state",
-                    new_callable=AsyncMock,
-                    return_value=checkpoint_state,
-                ),
-                patch(
-                    "lean_spec.subspecs.sync.checkpoint_sync.verify_checkpoint_state",
-                    new_callable=AsyncMock,
-                    return_value=True,
-                ),
-            ):
-                # Act
-                result = await _init_from_checkpoint(
-                    checkpoint_sync_url="http://localhost:5052",
-                    genesis=local_genesis,
-                    event_source=mock_event_source,
-                )
-
-            # Assert: Returns a Node instance
-            assert result is not None
-            assert isinstance(result, Node)
-
-            # Verify the node's store was initialized
-            assert result.store is not None
-
-        asyncio.run(run_test())
-
-    def test_checkpoint_sync_http_status_error_returns_none(self) -> None:
-        """Returns None when HTTP status error occurs."""
-
-        async def run_test() -> None:
-            from lean_spec.__main__ import _init_from_checkpoint
-            from lean_spec.subspecs.genesis import GenesisConfig
-            from lean_spec.subspecs.sync.checkpoint_sync import CheckpointSyncError
-
-            # Arrange
-            local_genesis = GenesisConfig.model_validate(
-                {
-                    "GENESIS_TIME": 1000,
-                    "GENESIS_VALIDATORS": [],
-                }
-            )
-
-            mock_event_source = AsyncMock()
-
-            with patch(
-                "lean_spec.subspecs.sync.checkpoint_sync.fetch_finalized_state",
+        with (
+            patch(
+                "lean_spec.__main__.fetch_finalized_state",
                 new_callable=AsyncMock,
-                side_effect=CheckpointSyncError("HTTP error 404: Not Found"),
-            ):
-                # Act
-                result = await _init_from_checkpoint(
-                    checkpoint_sync_url="http://localhost:5052",
-                    genesis=local_genesis,
-                    event_source=mock_event_source,
-                )
+                return_value=checkpoint_state,
+            ),
+            patch(
+                "lean_spec.__main__.verify_checkpoint_state",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            # Act
+            result = await _init_from_checkpoint(
+                checkpoint_sync_url="http://localhost:5052",
+                genesis=local_genesis,
+                event_source=mock_event_source,
+            )
 
-            # Assert
-            assert result is None
+        # Assert: Returns a Node instance
+        assert result is not None
+        assert isinstance(result, Node)
 
-        asyncio.run(run_test())
+        # Verify the node's store was initialized
+        assert result.store is not None
+
+    async def test_checkpoint_sync_http_status_error_returns_none(self) -> None:
+        """Returns None when HTTP status error occurs."""
+        # Arrange
+        local_genesis = GenesisConfig.model_validate(
+            {
+                "GENESIS_TIME": 1000,
+                "GENESIS_VALIDATORS": [],
+            }
+        )
+
+        mock_event_source = AsyncMock()
+
+        with patch(
+            "lean_spec.__main__.fetch_finalized_state",
+            new_callable=AsyncMock,
+            side_effect=CheckpointSyncError("HTTP error 404: Not Found"),
+        ):
+            # Act
+            result = await _init_from_checkpoint(
+                checkpoint_sync_url="http://localhost:5052",
+                genesis=local_genesis,
+                event_source=mock_event_source,
+            )
+
+        # Assert
+        assert result is None

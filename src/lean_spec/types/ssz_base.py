@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
-from typing import IO, Any, Self, Sequence
+from collections.abc import Sequence
+from typing import IO, Any, Self
 
 from .base import StrictBaseModel
 
@@ -118,5 +119,5 @@ class SSZModel(StrictBaseModel, SSZType):
         data: Sequence[Any] | None = getattr(self, "data", None)
         if data is not None:
             return f"{self.__class__.__name__}(data={list(data)!r})"
-        field_strs = [f"{name}={getattr(self, name)!r}" for name in type(self).model_fields.keys()]
+        field_strs = [f"{name}={getattr(self, name)!r}" for name in type(self).model_fields]
         return f"{self.__class__.__name__}({' '.join(field_strs)})"

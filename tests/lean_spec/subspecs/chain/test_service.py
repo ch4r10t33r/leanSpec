@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
@@ -22,23 +21,34 @@ class MockCheckpoint:
 
 @dataclass
 class MockStore:
-    """Mock store that tracks on_tick calls."""
+    """Mock store that tracks tick_interval calls."""
 
     time: Uint64 = field(default_factory=lambda: Uint64(0))
     tick_calls: list[tuple[Uint64, bool]] = field(default_factory=list)
     head: Bytes32 = field(default_factory=lambda: ZERO_HASH)
     latest_finalized: MockCheckpoint = field(default_factory=MockCheckpoint)
 
-    def on_tick(self, time: Uint64, has_proposal: bool) -> MockStore:
-        """Record the tick call and return a new store."""
+    def tick_interval(
+        self, has_proposal: bool, is_aggregator: bool = False
+    ) -> tuple[MockStore, list]:
+        """Record the tick call, advance time by one interval, and return a new store."""
+        new_time = self.time + Uint64(1)
         new_store = MockStore(
-            time=time,
-            tick_calls=list(self.tick_calls),
+            time=new_time,
+            tick_calls=[*self.tick_calls, (new_time, has_proposal)],
             head=self.head,
             latest_finalized=self.latest_finalized,
         )
-        new_store.tick_calls.append((time, has_proposal))
-        return new_store
+        return new_store, []
+
+    def model_copy(self, *, update: dict) -> MockStore:
+        """Return a copy with updated fields."""
+        return MockStore(
+            time=update.get("time", self.time),
+            tick_calls=list(self.tick_calls),
+            head=update.get("head", self.head),
+            latest_finalized=update.get("latest_finalized", self.latest_finalized),
+        )
 
 
 @dataclass
@@ -46,6 +56,12 @@ class MockSyncService:
     """Mock sync service for testing ChainService."""
 
     store: MockStore = field(default_factory=MockStore)
+    is_aggregator: bool = False
+    published_aggregations: list = field(default_factory=list)
+
+    async def publish_aggregated_attestation(self, agg: object) -> None:
+        """Record published aggregations."""
+        self.published_aggregations.append(agg)
 
 
 class TestChainServiceLifecycle:
@@ -80,7 +96,7 @@ class TestChainServiceLifecycle:
         chain_service.stop()
         assert chain_service.is_running is False
 
-    def test_run_sets_running_flag(self) -> None:
+    async def test_run_sets_running_flag(self) -> None:
         """
         run() sets the running flag before entering the main loop.
 
@@ -98,11 +114,8 @@ class TestChainServiceLifecycle:
             if call_count >= 2:
                 chain_service.stop()
 
-        async def run_briefly() -> None:
-            with patch("asyncio.sleep", new=stop_on_second_call):
-                await chain_service.run()
-
-        asyncio.run(run_briefly())
+        with patch("asyncio.sleep", new=stop_on_second_call):
+            await chain_service.run()
 
         # After stopping, flag should be False.
         assert chain_service.is_running is False
@@ -111,7 +124,7 @@ class TestChainServiceLifecycle:
 class TestIntervalTiming:
     """Tests for interval boundary timing."""
 
-    def test_sleep_calculation_mid_interval(self) -> None:
+    async def test_sleep_calculation_mid_interval(self) -> None:
         """
         Mid-interval sleep calculation ensures wakeup at next boundary.
 
@@ -131,18 +144,15 @@ class TestIntervalTiming:
             nonlocal captured_duration
             captured_duration = duration
 
-        async def check_sleep() -> None:
-            with patch("asyncio.sleep", new=capture_sleep):
-                await chain_service._sleep_until_next_interval()
-
-        asyncio.run(check_sleep())
+        with patch("asyncio.sleep", new=capture_sleep):
+            await chain_service.clock.sleep_until_next_interval()
 
         # Should sleep until next interval boundary.
         expected = float(genesis) + interval_secs - current_time
         assert captured_duration is not None
         assert abs(captured_duration - expected) < 0.002  # floating-point tolerance
 
-    def test_sleep_at_interval_boundary(self) -> None:
+    async def test_sleep_at_interval_boundary(self) -> None:
         """
         When clock reads exactly at interval boundary, sleep is one full interval.
 
@@ -161,18 +171,15 @@ class TestIntervalTiming:
             nonlocal captured_duration
             captured_duration = duration
 
-        async def check_sleep() -> None:
-            with patch("asyncio.sleep", new=capture_sleep):
-                await chain_service._sleep_until_next_interval()
-
-        asyncio.run(check_sleep())
+        with patch("asyncio.sleep", new=capture_sleep):
+            await chain_service.clock.sleep_until_next_interval()
 
         # At boundary, next boundary is one full interval away.
         expected = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         assert captured_duration is not None
         assert abs(captured_duration - expected) < 0.001
 
-    def test_sleep_before_genesis(self) -> None:
+    async def test_sleep_before_genesis(self) -> None:
         """
         Before genesis, sleeps until genesis time.
 
@@ -190,11 +197,8 @@ class TestIntervalTiming:
             nonlocal captured_duration
             captured_duration = duration
 
-        async def check_sleep() -> None:
-            with patch("asyncio.sleep", new=capture_sleep):
-                await chain_service._sleep_until_next_interval()
-
-        asyncio.run(check_sleep())
+        with patch("asyncio.sleep", new=capture_sleep):
+            await chain_service.clock.sleep_until_next_interval()
 
         # Should sleep until genesis.
         expected = float(genesis) - current_time
@@ -205,17 +209,17 @@ class TestIntervalTiming:
 class TestStoreTicking:
     """Tests for store tick integration."""
 
-    def test_ticks_store_with_current_time(self) -> None:
+    async def test_ticks_store_with_current_interval(self) -> None:
         """
-        Store receives current wall-clock time on tick.
+        Store receives the current interval count on tick.
 
-        The Store internally converts this to intervals for its time field.
+        The chain service passes intervals (not seconds) so the store
+        can advance time without lossy seconds→intervals conversion.
         """
         genesis = Uint64(1000)
-        # Several intervals after genesis.
+        # 5 intervals after genesis = 5 * 800ms = 4.0 seconds.
         interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         current_time = float(genesis) + 5 * interval_secs
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         sync_service = MockSyncService()
@@ -229,16 +233,15 @@ class TestStoreTicking:
             if call_count >= 2:
                 chain_service.stop()
 
-        async def run_limited() -> None:
-            with patch("asyncio.sleep", new=stop_on_second_call):
-                await chain_service.run()
+        with patch("asyncio.sleep", new=stop_on_second_call):
+            await chain_service.run()
 
-        asyncio.run(run_limited())
+        # Initial tick handles all 5 intervals (0→1, 1→2, ..., 4→5).
+        # Main loop recognizes the interval was handled and waits.
+        expected_ticks = [(Uint64(i), False) for i in range(1, 6)]
+        assert sync_service.store.tick_calls == expected_ticks
 
-        # Initial tick handles the interval, main loop recognizes it and waits.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
-
-    def test_has_proposal_always_false(self) -> None:
+    async def test_has_proposal_always_false(self) -> None:
         """
         has_proposal is always False for this minimal service.
 
@@ -247,7 +250,6 @@ class TestStoreTicking:
         genesis = Uint64(1000)
         interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         current_time = float(genesis) + 5 * interval_secs
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         sync_service = MockSyncService()
@@ -261,16 +263,13 @@ class TestStoreTicking:
             if tick_count >= 3:
                 chain_service.stop()
 
-        async def run_and_check() -> None:
-            with patch("asyncio.sleep", new=stop_after_three):
-                await chain_service.run()
-
-        asyncio.run(run_and_check())
+        with patch("asyncio.sleep", new=stop_after_three):
+            await chain_service.run()
 
         # All ticks have has_proposal=False.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
+        assert all(proposal is False for _, proposal in sync_service.store.tick_calls)
 
-    def test_sync_service_store_updated(self) -> None:
+    async def test_sync_service_store_updated(self) -> None:
         """
         SyncService.store is replaced with new store after each tick.
 
@@ -279,7 +278,6 @@ class TestStoreTicking:
         genesis = Uint64(1000)
         interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         current_time = float(genesis) + 5 * interval_secs
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         initial_store = MockStore()
@@ -292,23 +290,20 @@ class TestStoreTicking:
         async def stop_immediately(_duration: float) -> None:
             chain_service.stop()
 
-        async def run_once() -> None:
-            with patch("asyncio.sleep", new=stop_immediately):
-                await chain_service.run()
-
-        asyncio.run(run_once())
+        with patch("asyncio.sleep", new=stop_immediately):
+            await chain_service.run()
 
         # Store should have been replaced.
         assert sync_service.store is not initial_store
 
-        # Initial tick handles the interval, main loop recognizes it and waits.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
+        # Initial tick handles all 5 intervals.
+        assert sync_service.store.time == Uint64(5)
 
 
 class TestMultipleIntervals:
     """Tests for running through multiple intervals."""
 
-    def test_advances_through_intervals(self) -> None:
+    async def test_advances_through_intervals(self) -> None:
         """
         Service advances through multiple intervals correctly.
 
@@ -341,26 +336,23 @@ class TestMultipleIntervals:
             if time_index >= len(times):
                 chain_service.stop()
 
-        async def run_four_intervals() -> None:
-            with patch("asyncio.sleep", new=advance_and_stop):
-                await chain_service.run()
+        with patch("asyncio.sleep", new=advance_and_stop):
+            await chain_service.run()
 
-        asyncio.run(run_four_intervals())
-
-        # Initial tick at time[0], then main loop ticks at time[1], time[2], time[3].
-        # The initial tick handles time[0], so main loop skips it.
+        # Initial tick at interval 1, then main loop ticks at 2, 3, 4.
+        # Each _tick_to call ticks exactly one interval (gap=1 each time).
         assert sync_service.store.tick_calls == [
-            (Uint64(int(times[0])), False),
-            (Uint64(int(times[1])), False),
-            (Uint64(int(times[2])), False),
-            (Uint64(int(times[3])), False),
+            (Uint64(1), False),
+            (Uint64(2), False),
+            (Uint64(3), False),
+            (Uint64(4), False),
         ]
 
 
 class TestInitialTick:
     """Tests for the initial tick behavior at startup."""
 
-    def test_initial_tick_skipped_before_genesis(self) -> None:
+    async def test_initial_tick_skipped_before_genesis(self) -> None:
         """
         Initial tick is a no-op when current time is before genesis.
 
@@ -376,42 +368,36 @@ class TestInitialTick:
         chain_service = ChainService(sync_service=sync_service, clock=clock)  # type: ignore[arg-type]
 
         # Run just the initial tick without the full run loop.
-        async def run_initial_tick() -> None:
-            await chain_service._initial_tick()
-
-        asyncio.run(run_initial_tick())
+        await chain_service._initial_tick()
 
         # Store should not have been ticked.
         assert sync_service.store is initial_store
         assert sync_service.store.tick_calls == []
 
-    def test_initial_tick_executed_after_genesis(self) -> None:
+    async def test_initial_tick_executed_after_genesis(self) -> None:
         """
         Initial tick advances store time when past genesis.
 
         This ensures attestation validation works immediately on startup.
         """
         genesis = Uint64(1000)
-        # Several intervals after genesis.
+        # 5 intervals after genesis = 5 * 800ms = 4.0 seconds.
         interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         current_time = float(genesis) + 5 * interval_secs
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         initial_store = MockStore()
         sync_service = MockSyncService(store=initial_store)
         chain_service = ChainService(sync_service=sync_service, clock=clock)  # type: ignore[arg-type]
 
-        async def run_initial_tick() -> None:
-            await chain_service._initial_tick()
+        await chain_service._initial_tick()
 
-        asyncio.run(run_initial_tick())
-
-        # Store should have been replaced and ticked once.
+        # Store should have been replaced and ticked through all 5 intervals.
         assert sync_service.store is not initial_store
-        assert sync_service.store.tick_calls == [(expected_time, False)]
+        assert sync_service.store.time == Uint64(5)
+        assert len(sync_service.store.tick_calls) == 5
 
-    def test_initial_tick_at_exact_genesis(self) -> None:
+    async def test_initial_tick_at_exact_genesis(self) -> None:
         """
         Initial tick is executed when current time equals genesis.
 
@@ -419,27 +405,48 @@ class TestInitialTick:
         """
         genesis = Uint64(1000)
         current_time = float(genesis)  # Exactly at genesis
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         initial_store = MockStore()
         sync_service = MockSyncService(store=initial_store)
         chain_service = ChainService(sync_service=sync_service, clock=clock)  # type: ignore[arg-type]
 
-        async def run_initial_tick() -> None:
-            await chain_service._initial_tick()
+        await chain_service._initial_tick()
 
-        asyncio.run(run_initial_tick())
+        # At interval 0, no ticks needed (store already at time=0).
+        assert sync_service.store.time == Uint64(0)
+        assert sync_service.store.tick_calls == []
 
-        # Store should have been replaced and ticked once.
-        assert sync_service.store is not initial_store
-        assert sync_service.store.tick_calls == [(expected_time, False)]
+    async def test_initial_tick_skips_stale_intervals(self) -> None:
+        """
+        Initial tick skips stale intervals when far behind genesis.
+
+        When the gap exceeds one slot, only the last slot's worth of
+        intervals is processed. This prevents event loop starvation.
+        """
+        genesis = Uint64(1000)
+        interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
+        # 20 intervals after genesis (4 full slots).
+        current_time = float(genesis) + 20 * interval_secs
+
+        clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
+        sync_service = MockSyncService()
+        chain_service = ChainService(sync_service=sync_service, clock=clock)  # type: ignore[arg-type]
+
+        await chain_service._initial_tick()
+
+        # Gap=20 > INTERVALS_PER_SLOT(5), so skip to interval 15.
+        # Only last 5 intervals are ticked (15→16, ..., 19→20).
+        assert sync_service.store.time == Uint64(20)
+        assert len(sync_service.store.tick_calls) == 5
+        assert sync_service.store.tick_calls[0] == (Uint64(16), False)
+        assert sync_service.store.tick_calls[-1] == (Uint64(20), False)
 
 
 class TestIntervalTracking:
     """Tests for the last_handled_total_interval tracking logic."""
 
-    def test_does_not_reprocess_same_interval(self) -> None:
+    async def test_does_not_reprocess_same_interval(self) -> None:
         """
         Same interval is not processed twice when processing is fast.
 
@@ -449,8 +456,8 @@ class TestIntervalTracking:
         genesis = Uint64(1000)
         interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         # Halfway into second interval (stays constant).
+        # 1.5 intervals * 800ms = 1200ms. total_intervals = 1200 // 800 = 1.
         current_time = float(genesis) + interval_secs + interval_secs / 2
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         sync_service = MockSyncService()
@@ -466,21 +473,18 @@ class TestIntervalTracking:
             if sleep_call_count >= 3:
                 chain_service.stop()
 
-        async def run_test() -> None:
-            with patch("asyncio.sleep", new=count_sleeps_and_stop):
-                await chain_service.run()
+        with patch("asyncio.sleep", new=count_sleeps_and_stop):
+            await chain_service.run()
 
-        asyncio.run(run_test())
-
-        # Only the initial tick happens.
+        # Only the initial tick happens (one interval: 0→1).
         # The interval tracking prevents redundant ticks for the same interval.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
+        assert sync_service.store.tick_calls == [(Uint64(1), False)]
 
 
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
 
-    def test_genesis_time_zero(self) -> None:
+    async def test_genesis_time_zero(self) -> None:
         """
         Works correctly with genesis_time of 0.
 
@@ -488,7 +492,6 @@ class TestEdgeCases:
         """
         genesis = Uint64(0)
         current_time = 5 * (float(MILLISECONDS_PER_INTERVAL) / 1000.0)
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         sync_service = MockSyncService()
@@ -497,24 +500,23 @@ class TestEdgeCases:
         async def stop_immediately(_duration: float) -> None:
             chain_service.stop()
 
-        async def run_once() -> None:
-            with patch("asyncio.sleep", new=stop_immediately):
-                await chain_service.run()
+        with patch("asyncio.sleep", new=stop_immediately):
+            await chain_service.run()
 
-        asyncio.run(run_once())
+        # Initial tick advances through 5 intervals.
+        assert sync_service.store.time == Uint64(5)
+        assert len(sync_service.store.tick_calls) == 5
 
-        # Initial tick handles the interval, main loop recognizes it and waits.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
-
-    def test_large_genesis_time(self) -> None:
+    async def test_large_genesis_time(self) -> None:
         """
         Works with realistic Unix timestamp genesis times.
 
         Tests that large integer arithmetic works correctly.
         """
         genesis = Uint64(1700000000)  # Nov 2023
+        # 100 intervals = 80s, plus 0.5s mid-interval offset.
+        # total_intervals = int(80.5 * 1000) // 800 = 80500 // 800 = 100.
         current_time = float(genesis) + 100 * (float(MILLISECONDS_PER_INTERVAL) / 1000.0) + 0.5
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         sync_service = MockSyncService()
@@ -523,16 +525,15 @@ class TestEdgeCases:
         async def stop_immediately(_duration: float) -> None:
             chain_service.stop()
 
-        async def run_once() -> None:
-            with patch("asyncio.sleep", new=stop_immediately):
-                await chain_service.run()
+        with patch("asyncio.sleep", new=stop_immediately):
+            await chain_service.run()
 
-        asyncio.run(run_once())
+        # Gap=100 > INTERVALS_PER_SLOT(5), so stale intervals are skipped.
+        # Only the last 5 intervals are ticked (96→97, ..., 99→100).
+        assert sync_service.store.time == Uint64(100)
+        assert len(sync_service.store.tick_calls) == 5
 
-        # Initial tick handles the interval, main loop recognizes it and waits.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
-
-    def test_stop_during_sleep(self) -> None:
+    async def test_stop_during_sleep(self) -> None:
         """
         Service exits cleanly when stopped during sleep.
 
@@ -541,7 +542,6 @@ class TestEdgeCases:
         genesis = Uint64(1000)
         interval_secs = float(MILLISECONDS_PER_INTERVAL) / 1000.0
         current_time = float(genesis) + 5 * interval_secs
-        expected_time = Uint64(int(current_time))
 
         clock = SlotClock(genesis_time=genesis, time_fn=lambda: current_time)
         sync_service = MockSyncService()
@@ -551,14 +551,12 @@ class TestEdgeCases:
             # Simulate stop being called while sleeping.
             chain_service.stop()
 
-        async def run_test() -> None:
-            with patch("asyncio.sleep", new=stop_during_sleep):
-                await chain_service.run()
-
-        asyncio.run(run_test())
+        with patch("asyncio.sleep", new=stop_during_sleep):
+            await chain_service.run()
 
         # Service should have stopped cleanly.
         assert chain_service.is_running is False
 
-        # Only initial tick happens before stop.
-        assert sync_service.store.tick_calls == [(expected_time, False)]
+        # Initial tick handles all 5 intervals even though stop is called
+        # during the yield sleeps (stop only checked in main loop).
+        assert sync_service.store.time == Uint64(5)

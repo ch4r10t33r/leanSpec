@@ -1,6 +1,5 @@
 """
-Slot Clock
-==========
+Slot Clock.
 
 Time-to-slot conversion for Lean Consensus.
 
@@ -9,17 +8,21 @@ model used by consensus. Every node must agree on slot boundaries to
 coordinate block proposals and attestations.
 """
 
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import time as wall_time
-from typing import Callable
 
 from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.types import Uint64
 
 from .config import MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SECONDS_PER_SLOT
 
-Interval = Uint64
-"""Interval count since genesis (matches ``Store.time``)."""
+
+class Interval(Uint64):
+    """Interval count since genesis (matches ``Store.time``)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +61,7 @@ class SlotClock:
     def current_interval(self) -> Interval:
         """Get the current interval within the slot (0-4)."""
         milliseconds_into_slot = self._milliseconds_since_genesis() % MILLISECONDS_PER_SLOT
-        return milliseconds_into_slot // MILLISECONDS_PER_INTERVAL
+        return Interval(milliseconds_into_slot // MILLISECONDS_PER_INTERVAL)
 
     def total_intervals(self) -> Interval:
         """
@@ -66,7 +69,7 @@ class SlotClock:
 
         This is the value expected by our store time type.
         """
-        return self._milliseconds_since_genesis() // MILLISECONDS_PER_INTERVAL
+        return Interval(self._milliseconds_since_genesis() // MILLISECONDS_PER_INTERVAL)
 
     def current_time(self) -> Uint64:
         """Get current wall-clock time as Uint64 (Unix timestamp in seconds)."""
@@ -94,3 +97,9 @@ class SlotClock:
         # Time until next boundary (may be 0 if exactly at boundary).
         ms_until_next = int(MILLISECONDS_PER_INTERVAL) - time_into_interval_ms
         return ms_until_next / 1000.0
+
+    async def sleep_until_next_interval(self) -> None:
+        """Sleep until the next interval boundary."""
+        sleep_time = self.seconds_until_next_interval()
+        if sleep_time > 0:
+            await asyncio.sleep(sleep_time)

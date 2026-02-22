@@ -21,13 +21,15 @@ References:
 from __future__ import annotations
 
 from lean_spec.subspecs.networking.types import SeqNumber
-from lean_spec.types import Uint64, decode_rlp, encode_rlp
+from lean_spec.types import RLPItem, Uint64, decode_rlp, decode_rlp_list, encode_rlp
 from lean_spec.types.rlp import RLPDecodingError
 from lean_spec.types.uint import Uint8
 
 from .messages import (
     Distance,
     FindNode,
+    IPv4,
+    IPv6,
     MessageType,
     Nodes,
     Ping,
@@ -38,7 +40,7 @@ from .messages import (
     TalkResp,
 )
 
-DiscoveryMessage = Ping | Pong | FindNode | Nodes | TalkReq | TalkResp
+type DiscoveryMessage = Ping | Pong | FindNode | Nodes | TalkReq | TalkResp
 """Union of all Discovery v5 protocol messages."""
 
 
@@ -62,19 +64,21 @@ def encode_message(msg: DiscoveryMessage) -> bytes:
     Returns:
         Encoded message bytes.
     """
-    if isinstance(msg, Ping):
-        return _encode_ping(msg)
-    if isinstance(msg, Pong):
-        return _encode_pong(msg)
-    if isinstance(msg, FindNode):
-        return _encode_findnode(msg)
-    if isinstance(msg, Nodes):
-        return _encode_nodes(msg)
-    if isinstance(msg, TalkReq):
-        return _encode_talkreq(msg)
-    if isinstance(msg, TalkResp):
-        return _encode_talkresp(msg)
-    raise MessageEncodingError(f"Unknown message type: {type(msg).__name__}")
+    match msg:
+        case Ping():
+            return _encode_ping(msg)
+        case Pong():
+            return _encode_pong(msg)
+        case FindNode():
+            return _encode_findnode(msg)
+        case Nodes():
+            return _encode_nodes(msg)
+        case TalkReq():
+            return _encode_talkreq(msg)
+        case TalkResp():
+            return _encode_talkresp(msg)
+        case _:
+            raise MessageEncodingError(f"Unknown message type: {type(msg).__name__}")
 
 
 def decode_message(data: bytes) -> DiscoveryMessage:
@@ -97,19 +101,21 @@ def decode_message(data: bytes) -> DiscoveryMessage:
     payload = data[1:]
 
     try:
-        if msg_type == MessageType.PING:
-            return _decode_ping(payload)
-        if msg_type == MessageType.PONG:
-            return _decode_pong(payload)
-        if msg_type == MessageType.FINDNODE:
-            return _decode_findnode(payload)
-        if msg_type == MessageType.NODES:
-            return _decode_nodes(payload)
-        if msg_type == MessageType.TALKREQ:
-            return _decode_talkreq(payload)
-        if msg_type == MessageType.TALKRESP:
-            return _decode_talkresp(payload)
-        raise MessageDecodingError(f"Unknown message type: {msg_type:#x}")
+        match msg_type:
+            case MessageType.PING:
+                return _decode_ping(payload)
+            case MessageType.PONG:
+                return _decode_pong(payload)
+            case MessageType.FINDNODE:
+                return _decode_findnode(payload)
+            case MessageType.NODES:
+                return _decode_nodes(payload)
+            case MessageType.TALKREQ:
+                return _decode_talkreq(payload)
+            case MessageType.TALKRESP:
+                return _decode_talkresp(payload)
+            case _:
+                raise MessageDecodingError(f"Unknown message type: {msg_type:#x}")
     except RLPDecodingError as e:
         raise MessageDecodingError(f"Invalid RLP: {e}") from e
     except (IndexError, ValueError) as e:
@@ -154,8 +160,8 @@ def _encode_ping(msg: Ping) -> bytes:
 
 def _decode_ping(payload: bytes) -> Ping:
     """Decode PING message."""
-    items = decode_rlp(payload)
-    if not isinstance(items, list) or len(items) != 2:
+    items = decode_rlp_list(payload)
+    if len(items) != 2:
         raise MessageDecodingError("PING requires 2 elements")
 
     return Ping(
@@ -177,17 +183,18 @@ def _encode_pong(msg: Pong) -> bytes:
 
 def _decode_pong(payload: bytes) -> Pong:
     """Decode PONG message."""
-    items = decode_rlp(payload)
-    if not isinstance(items, list) or len(items) != 4:
+    items = decode_rlp_list(payload)
+    if len(items) != 4:
         raise MessageDecodingError("PONG requires 4 elements")
 
-    port_bytes = items[3]
-    port = int.from_bytes(port_bytes, "big") if port_bytes else 0
+    port = int.from_bytes(items[3], "big") if items[3] else 0
+    ip_bytes = items[2]
+    recipient_ip = IPv4(ip_bytes) if len(ip_bytes) == IPv4.LENGTH else IPv6(ip_bytes)
 
     return Pong(
         request_id=_decode_request_id(items[0]),
         enr_seq=SeqNumber(_decode_uint64(items[1])),
-        recipient_ip=items[2],
+        recipient_ip=recipient_ip,
         recipient_port=Port(port),
     )
 
@@ -208,6 +215,10 @@ def _decode_findnode(payload: bytes) -> FindNode:
     if not isinstance(items, list) or len(items) != 2:
         raise MessageDecodingError("FINDNODE requires 2 elements")
 
+    request_id_raw = items[0]
+    if not isinstance(request_id_raw, bytes):
+        raise MessageDecodingError("FINDNODE request-id must be bytes")
+
     distances_raw = items[1]
     if not isinstance(distances_raw, list):
         raise MessageDecodingError("FINDNODE distances must be a list")
@@ -215,17 +226,18 @@ def _decode_findnode(payload: bytes) -> FindNode:
     distances = [Distance(int.from_bytes(d, "big") if d else 0) for d in distances_raw]
 
     return FindNode(
-        request_id=_decode_request_id(items[0]),
+        request_id=_decode_request_id(request_id_raw),
         distances=distances,
     )
 
 
 def _encode_nodes(msg: Nodes) -> bytes:
     """Encode NODES message."""
-    items = [
+    enrs: list[RLPItem] = list(msg.enrs)
+    items: list[RLPItem] = [
         _encode_request_id(msg.request_id),
         bytes([int(msg.total)]) if int(msg.total) > 0 else b"",
-        msg.enrs,
+        enrs,
     ]
     return bytes([MessageType.NODES]) + encode_rlp(items)
 
@@ -236,8 +248,14 @@ def _decode_nodes(payload: bytes) -> Nodes:
     if not isinstance(items, list) or len(items) != 3:
         raise MessageDecodingError("NODES requires 3 elements")
 
-    total_bytes = items[1]
-    total = total_bytes[0] if total_bytes else 0
+    request_id_raw = items[0]
+    if not isinstance(request_id_raw, bytes):
+        raise MessageDecodingError("NODES request-id must be bytes")
+
+    total_raw = items[1]
+    if not isinstance(total_raw, bytes):
+        raise MessageDecodingError("NODES total must be bytes")
+    total = total_raw[0] if total_raw else 0
 
     enrs_raw = items[2]
     if not isinstance(enrs_raw, list):
@@ -246,7 +264,7 @@ def _decode_nodes(payload: bytes) -> Nodes:
     enrs = [e if isinstance(e, bytes) else b"" for e in enrs_raw]
 
     return Nodes(
-        request_id=_decode_request_id(items[0]),
+        request_id=_decode_request_id(request_id_raw),
         total=Uint8(total),
         enrs=enrs,
     )
@@ -264,8 +282,8 @@ def _encode_talkreq(msg: TalkReq) -> bytes:
 
 def _decode_talkreq(payload: bytes) -> TalkReq:
     """Decode TALKREQ message."""
-    items = decode_rlp(payload)
-    if not isinstance(items, list) or len(items) != 3:
+    items = decode_rlp_list(payload)
+    if len(items) != 3:
         raise MessageDecodingError("TALKREQ requires 3 elements")
 
     return TalkReq(
@@ -286,18 +304,11 @@ def _encode_talkresp(msg: TalkResp) -> bytes:
 
 def _decode_talkresp(payload: bytes) -> TalkResp:
     """Decode TALKRESP message."""
-    items = decode_rlp(payload)
-    if not isinstance(items, list) or len(items) != 2:
+    items = decode_rlp_list(payload)
+    if len(items) != 2:
         raise MessageDecodingError("TALKRESP requires 2 elements")
 
     return TalkResp(
         request_id=_decode_request_id(items[0]),
         response=items[1],
     )
-
-
-def generate_request_id() -> RequestId:
-    """Generate a random request ID."""
-    import os
-
-    return RequestId(data=os.urandom(8))

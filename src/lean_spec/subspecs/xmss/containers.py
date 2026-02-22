@@ -7,7 +7,12 @@ Base types (HashDigestVector, Parameter, etc.) are defined in types.py.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping, NamedTuple
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, NamedTuple
+
+from pydantic import model_serializer
+
+from lean_spec.subspecs.containers.slot import Slot
 
 from ...types import Bytes32, Uint64
 from ...types.container import Container
@@ -50,14 +55,17 @@ class Signature(Container):
     A signature produced by the `sign` function.
 
     It contains all the necessary components for a verifier to confirm that a
-    specific message was signed by the owner of a `PublicKey` for a specific epoch.
+    specific message was signed by the owner of a `PublicKey` for a specific slot.
 
     SSZ Container with fields:
     - path: HashTreeOpening (container with siblings list)
     - rho: Vector[Fp, RAND_LEN_FE]
     - hashes: List[Vector[Fp, HASH_DIGEST_LENGTH], NODE_LIST_LIMIT]
 
-    Serialization is handled automatically by SSZ.
+    This is a variable-size Container because path and hashes are variable-size
+    fields. The field dimensions are determined by the scheme parameters, so in
+    practice every valid signature serializes to the same byte count, but the SSZ
+    type system correctly classifies it as variable-size.
     """
 
     path: HashTreeOpening
@@ -67,12 +75,17 @@ class Signature(Container):
     hashes: HashDigestList
     """The one-time signature itself: a list of intermediate Winternitz chain hashes."""
 
+    @model_serializer(mode="plain", when_used="json")
+    def _serialize_as_bytes(self) -> str:
+        """Serialize as hex-encoded SSZ bytes for JSON output."""
+        return "0x" + self.encode_bytes().hex()
+
     def verify(
         self,
         public_key: PublicKey,
-        epoch: "Uint64",
-        message: "Bytes32",
-        scheme: "GeneralizedXmssScheme",
+        slot: Slot,
+        message: Bytes32,
+        scheme: GeneralizedXmssScheme,
     ) -> bool:
         """
         Verify the signature using XMSS verification algorithm.
@@ -82,13 +95,13 @@ class Signature(Container):
         Invalid or malformed signatures return `False`.
 
         Expected exceptions:
-        - `ValueError` for invalid epochs,
+        - `ValueError` for invalid slots,
         - `IndexError` for malformed signatures
         are caught and converted to `False`.
 
         Args:
             public_key: The public key to verify against.
-            epoch: The epoch the signature corresponds to.
+            slot: The slot the signature corresponds to.
             message: The message that was supposedly signed.
             scheme: The XMSS scheme instance to use for verification.
 
@@ -96,7 +109,7 @@ class Signature(Container):
             `True` if the signature is valid, `False` otherwise.
         """
         try:
-            return scheme.verify(public_key, epoch, message, self)
+            return scheme.verify(public_key, slot, message, self)
         except (ValueError, IndexError):
             return False
 
@@ -106,13 +119,13 @@ class SecretKey(Container):
     The private component of a key pair. **MUST BE KEPT CONFIDENTIAL.**
 
     This object contains all the secret material and pre-computed data needed to
-    generate signatures for any epoch within its active lifetime.
+    generate signatures for any slot within its active lifetime.
 
     SSZ Container with fields:
     - prf_key: Bytes[PRF_KEY_LENGTH]
     - parameter: Vector[Fp, PARAMETER_LEN]
-    - activation_epoch: uint64
-    - num_active_epochs: uint64
+    - activation_slot: uint64
+    - num_active_slots: uint64
     - top_tree: HashSubTree
     - left_bottom_tree_index: uint64
     - left_bottom_tree: HashSubTree
@@ -127,17 +140,17 @@ class SecretKey(Container):
     parameter: Parameter
     """The public parameter `P`, stored for convenience during signing."""
 
-    activation_epoch: Uint64
+    activation_slot: Slot
     """
-    The first epoch for which this secret key is valid.
+    The first slot for which this secret key is valid.
 
     Note: With top-bottom trees, this is aligned to a multiple of `sqrt(LIFETIME)`
     to ensure efficient tree partitioning.
     """
 
-    num_active_epochs: Uint64
+    num_active_slots: Uint64
     """
-    The number of consecutive epochs this key can be used for.
+    The number of consecutive slots this key can be used for.
 
     Note: With top-bottom trees, this is rounded up to be a multiple of
     `sqrt(LIFETIME)`, with a minimum of `2 * sqrt(LIFETIME)`.
@@ -155,7 +168,7 @@ class SecretKey(Container):
     """
     The index of the left bottom tree in the sliding window.
 
-    Bottom trees are numbered 0, 1, 2, ... where tree `i` covers epochs
+    Bottom trees are numbered 0, 1, 2, ... where tree `i` covers slots
     `[i * sqrt(LIFETIME), (i+1) * sqrt(LIFETIME))`.
 
     The prepared interval is:
@@ -167,7 +180,7 @@ class SecretKey(Container):
     """
     The left bottom tree in the sliding window.
 
-    This covers epochs:
+    This covers slots:
     [left_bottom_tree_index * sqrt(LIFETIME), (left_bottom_tree_index + 1) * sqrt(LIFETIME))
     """
 
@@ -175,11 +188,11 @@ class SecretKey(Container):
     """
     The right bottom tree in the sliding window.
 
-    This covers epochs:
+    This covers slots:
     [(left_bottom_tree_index + 1) * sqrt(LIFETIME), (left_bottom_tree_index + 2) * sqrt(LIFETIME))
 
     Together with `left_bottom_tree`, this provides a prepared interval of
-    exactly `2 * sqrt(LIFETIME)` consecutive epochs.
+    exactly `2 * sqrt(LIFETIME)` consecutive slots.
     """
 
 

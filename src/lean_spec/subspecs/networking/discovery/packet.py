@@ -32,17 +32,15 @@ from __future__ import annotations
 import os
 import struct
 from dataclasses import dataclass
-from enum import IntEnum
+from typing import Final
 
-from lean_spec.types import Uint64
+from lean_spec.subspecs.networking.types import NodeId, SeqNumber
+from lean_spec.types import Bytes12, Bytes16, Bytes33, Bytes64
 
 from .config import MAX_PACKET_SIZE, MIN_PACKET_SIZE
 from .crypto import (
     AES_KEY_SIZE,
-    COMPRESSED_PUBKEY_SIZE,
     CTR_IV_SIZE,
-    GCM_NONCE_SIZE,
-    ID_SIGNATURE_SIZE,
     aes_ctr_decrypt,
     aes_ctr_encrypt,
     aes_gcm_decrypt,
@@ -50,25 +48,17 @@ from .crypto import (
 )
 from .messages import PROTOCOL_ID, PROTOCOL_VERSION, IdNonce, Nonce, PacketFlag
 
-STATIC_HEADER_SIZE = 23
+STATIC_HEADER_SIZE: Final = 23
 """Size of the static header in bytes: 6 + 2 + 1 + 12 + 2."""
 
-MESSAGE_AUTHDATA_SIZE = 32
+MESSAGE_AUTHDATA_SIZE: Final = 32
 """Authdata size for MESSAGE packets: src-id (32 bytes)."""
 
-WHOAREYOU_AUTHDATA_SIZE = 24
+WHOAREYOU_AUTHDATA_SIZE: Final = 24
 """Authdata size for WHOAREYOU packets: id-nonce (16) + enr-seq (8)."""
 
-HANDSHAKE_HEADER_SIZE = 34
+HANDSHAKE_HEADER_SIZE: Final = 34
 """Fixed portion of handshake authdata: src-id (32) + sig-size (1) + eph-key-size (1)."""
-
-
-class PacketType(IntEnum):
-    """Packet type aliases matching PacketFlag for clarity."""
-
-    MESSAGE = 0
-    WHOAREYOU = 1
-    HANDSHAKE = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +79,7 @@ class PacketHeader:
 class MessageAuthdata:
     """Authdata for MESSAGE packets (flag=0)."""
 
-    src_id: bytes
+    src_id: NodeId
     """Sender's 32-byte node ID."""
 
 
@@ -100,7 +90,7 @@ class WhoAreYouAuthdata:
     id_nonce: IdNonce
     """16-byte identity challenge nonce."""
 
-    enr_seq: Uint64
+    enr_seq: SeqNumber
     """Sender's last known ENR sequence for the target. 0 if unknown."""
 
 
@@ -108,7 +98,7 @@ class WhoAreYouAuthdata:
 class HandshakeAuthdata:
     """Authdata for HANDSHAKE packets (flag=2)."""
 
-    src_id: bytes
+    src_id: NodeId
     """Sender's 32-byte node ID."""
 
     sig_size: int
@@ -117,10 +107,10 @@ class HandshakeAuthdata:
     eph_key_size: int
     """Size of ephemeral public key. 33 for compressed secp256k1."""
 
-    id_signature: bytes
+    id_signature: Bytes64
     """ID nonce signature proving identity ownership."""
 
-    eph_pubkey: bytes
+    eph_pubkey: Bytes33
     """Ephemeral public key for ECDH."""
 
     record: bytes | None
@@ -128,43 +118,40 @@ class HandshakeAuthdata:
 
 
 def encode_packet(
-    dest_node_id: bytes,
-    src_node_id: bytes,
+    dest_node_id: NodeId,
     flag: PacketFlag,
-    nonce: bytes,
+    nonce: Nonce,
     authdata: bytes,
     message: bytes,
-    encryption_key: bytes | None = None,
+    encryption_key: Bytes16 | None = None,
+    masking_iv: Bytes16 | None = None,
 ) -> bytes:
     """
     Encode a Discovery v5 packet.
 
     Args:
         dest_node_id: 32-byte destination node ID (for header masking).
-        src_node_id: 32-byte source node ID (only used for logging/debugging).
         flag: Packet type flag.
         nonce: 12-byte message nonce.
         authdata: Authentication data (varies by packet type).
         message: Message payload (plaintext for WHOAREYOU, encrypted otherwise).
         encryption_key: 16-byte key for message encryption (None for WHOAREYOU).
+        masking_iv: Optional 16-byte IV for header masking. Random if not provided.
+            Must be provided for WHOAREYOU to match the IV used in challenge_data.
 
     Returns:
         Complete encoded packet ready for UDP transmission.
     """
-    if len(dest_node_id) != 32:
-        raise ValueError(f"Destination node ID must be 32 bytes, got {len(dest_node_id)}")
-    if len(nonce) != GCM_NONCE_SIZE:
-        raise ValueError(f"Nonce must be {GCM_NONCE_SIZE} bytes, got {len(nonce)}")
+    if masking_iv is None:
+        # Fresh random IV for header masking.
+        #
+        # Using dest_node_id as the masking key is deterministic,
+        # so the IV MUST be random to prevent ciphertext patterns.
+        # Without randomness, identical packets would produce
+        # identical masked headers, enabling traffic analysis.
+        masking_iv = Bytes16(os.urandom(CTR_IV_SIZE))
 
-    # Fresh random IV for header masking.
-    #
-    # Using dest_node_id as the masking key is deterministic,
-    # so the IV MUST be random to prevent ciphertext patterns.
-    # Without randomness, identical packets would produce
-    # identical masked headers, enabling traffic analysis.
-    masking_iv = os.urandom(CTR_IV_SIZE)
-
-    static_header = _encode_static_header(flag, nonce, len(authdata))
+    static_header = encode_static_header(flag, nonce, len(authdata))
     header = static_header + authdata
 
     # Header masking hides protocol metadata from observers.
@@ -172,7 +159,7 @@ def encode_packet(
     # The masking key is derived from the destination node ID.
     # Only the intended recipient can unmask the header.
     # This provides privacy without requiring key exchange.
-    masking_key = dest_node_id[:AES_KEY_SIZE]
+    masking_key = Bytes16(dest_node_id[:AES_KEY_SIZE])
     masked_header = aes_ctr_encrypt(masking_key, masking_iv, header)
 
     if flag == PacketFlag.WHOAREYOU:
@@ -182,14 +169,15 @@ def encode_packet(
         if encryption_key is None:
             raise ValueError("Encryption key required for non-WHOAREYOU packets")
 
-        # Masked header as AAD prevents header tampering.
+        # Per spec: message-ad = masking-iv || header (plaintext).
         #
-        # The recipient verifies the header wasn't modified
-        # without having to decrypt the payload first.
-        encrypted_message = aes_gcm_encrypt(encryption_key, nonce, message, masked_header)
+        # The AAD binds the plaintext header to the encrypted message.
+        # The recipient reconstructs this from the decoded header.
+        message_ad = bytes(masking_iv) + header
+        encrypted_message = aes_gcm_encrypt(encryption_key, Bytes12(nonce), message, message_ad)
 
     # Assemble packet.
-    packet = masking_iv + masked_header + encrypted_message
+    packet = bytes(masking_iv) + masked_header + encrypted_message
 
     if len(packet) > MAX_PACKET_SIZE:
         raise ValueError(f"Packet exceeds max size: {len(packet)} > {MAX_PACKET_SIZE}")
@@ -197,7 +185,7 @@ def encode_packet(
     return packet
 
 
-def decode_packet_header(local_node_id: bytes, data: bytes) -> tuple[PacketHeader, bytes]:
+def decode_packet_header(local_node_id: NodeId, data: bytes) -> tuple[PacketHeader, bytes, bytes]:
     """
     Decode and unmask a Discovery v5 packet header.
 
@@ -206,7 +194,8 @@ def decode_packet_header(local_node_id: bytes, data: bytes) -> tuple[PacketHeade
         data: Raw packet bytes.
 
     Returns:
-        Tuple of (header, message_bytes).
+        Tuple of (header, message_bytes, message_ad).
+        message_ad is masking-iv || plaintext header, used as AAD for decryption.
 
     Raises:
         ValueError: If packet is malformed.
@@ -215,17 +204,22 @@ def decode_packet_header(local_node_id: bytes, data: bytes) -> tuple[PacketHeade
         raise ValueError(f"Packet too small: {len(data)} < {MIN_PACKET_SIZE}")
 
     # Extract masking IV.
-    masking_iv = data[:CTR_IV_SIZE]
+    masking_iv = Bytes16(data[:CTR_IV_SIZE])
 
-    # Unmask enough to read the static header.
-    masking_key = local_node_id[:AES_KEY_SIZE]
+    # Unmask the static header to learn the authdata size, then unmask the rest.
+    #
+    # AES-CTR is a stream cipher: decrypting the first N bytes produces the same
+    # output regardless of how many bytes follow. We exploit this by first
+    # decrypting just the 23-byte static header to read authdata_size, then
+    # decrypting the full header (static + authdata) in a single pass.
+    # The second call recomputes the keystream from offset 0, so both passes
+    # produce identical plaintext for the overlapping bytes.
+    masking_key = Bytes16(local_node_id[:AES_KEY_SIZE])
     masked_data = data[CTR_IV_SIZE:]
 
-    # Decrypt static header first to get authdata size.
-    static_header_masked = masked_data[:STATIC_HEADER_SIZE]
-    static_header = aes_ctr_decrypt(masking_key, masking_iv, static_header_masked)
+    # First pass: decrypt static header to learn authdata size.
+    static_header = aes_ctr_decrypt(masking_key, masking_iv, masked_data[:STATIC_HEADER_SIZE])
 
-    # Parse static header.
     protocol_id = static_header[:6]
     if protocol_id != PROTOCOL_ID:
         raise ValueError(f"Invalid protocol ID: {protocol_id!r}")
@@ -238,27 +232,30 @@ def decode_packet_header(local_node_id: bytes, data: bytes) -> tuple[PacketHeade
     nonce = Nonce(static_header[9:21])
     authdata_size = struct.unpack(">H", static_header[21:23])[0]
 
-    # Verify we have enough data for authdata.
     header_end = CTR_IV_SIZE + STATIC_HEADER_SIZE + authdata_size
     if len(data) < header_end:
         raise ValueError(f"Packet truncated: need {header_end}, have {len(data)}")
 
-    # Decrypt the full header including authdata.
-    full_masked_header = masked_data[: STATIC_HEADER_SIZE + authdata_size]
-    full_header = aes_ctr_decrypt(masking_key, masking_iv, full_masked_header)
+    # Second pass: decrypt full header (static + authdata) from offset 0.
+    full_header = aes_ctr_decrypt(
+        masking_key, masking_iv, masked_data[: STATIC_HEADER_SIZE + authdata_size]
+    )
     authdata = full_header[STATIC_HEADER_SIZE:]
 
     # Message bytes are everything after the header.
     message_bytes = data[header_end:]
 
-    return PacketHeader(flag=flag, nonce=nonce, authdata=authdata), message_bytes
+    # Per spec: message-ad = masking-iv || header (plaintext).
+    message_ad = bytes(masking_iv) + full_header
+
+    return PacketHeader(flag=flag, nonce=nonce, authdata=authdata), message_bytes, message_ad
 
 
 def decode_message_authdata(authdata: bytes) -> MessageAuthdata:
     """Decode MESSAGE packet authdata."""
     if len(authdata) != MESSAGE_AUTHDATA_SIZE:
         raise ValueError(f"Invalid MESSAGE authdata size: {len(authdata)}")
-    return MessageAuthdata(src_id=authdata)
+    return MessageAuthdata(src_id=NodeId(authdata))
 
 
 def decode_whoareyou_authdata(authdata: bytes) -> WhoAreYouAuthdata:
@@ -267,31 +264,35 @@ def decode_whoareyou_authdata(authdata: bytes) -> WhoAreYouAuthdata:
         raise ValueError(f"Invalid WHOAREYOU authdata size: {len(authdata)}")
 
     id_nonce = IdNonce(authdata[:16])
-    enr_seq = Uint64(struct.unpack(">Q", authdata[16:24])[0])
+    enr_seq = SeqNumber(struct.unpack(">Q", authdata[16:24])[0])
 
     return WhoAreYouAuthdata(id_nonce=id_nonce, enr_seq=enr_seq)
 
 
 def decode_handshake_authdata(authdata: bytes) -> HandshakeAuthdata:
     """Decode HANDSHAKE packet authdata."""
+    # Fixed header: src-id (32 bytes) + sig-size (1 byte) + eph-key-size (1 byte) = 34 bytes.
     if len(authdata) < HANDSHAKE_HEADER_SIZE:
         raise ValueError(f"Handshake authdata too small: {len(authdata)}")
 
-    src_id = authdata[:32]
+    src_id = NodeId(authdata[:32])
     sig_size = authdata[32]
     eph_key_size = authdata[33]
 
+    # Variable fields follow the fixed header: signature + ephemeral key + optional ENR.
     expected_min = HANDSHAKE_HEADER_SIZE + sig_size + eph_key_size
     if len(authdata) < expected_min:
         raise ValueError(f"Handshake authdata truncated: {len(authdata)} < {expected_min}")
 
     offset = HANDSHAKE_HEADER_SIZE
-    id_signature = authdata[offset : offset + sig_size]
+    id_signature = Bytes64(authdata[offset : offset + sig_size])
     offset += sig_size
 
-    eph_pubkey = authdata[offset : offset + eph_key_size]
+    eph_pubkey = Bytes33(authdata[offset : offset + eph_key_size])
     offset += eph_key_size
 
+    # Remaining bytes are the RLP-encoded ENR, included when the recipient's
+    # known enr_seq was stale (signaled by WHOAREYOU.enr_seq < sender's seq).
     record = authdata[offset:] if offset < len(authdata) else None
 
     return HandshakeAuthdata(
@@ -305,10 +306,10 @@ def decode_handshake_authdata(authdata: bytes) -> HandshakeAuthdata:
 
 
 def decrypt_message(
-    encryption_key: bytes,
-    nonce: bytes,
+    encryption_key: Bytes16,
+    nonce: Nonce,
     ciphertext: bytes,
-    masked_header: bytes,
+    message_ad: bytes,
 ) -> bytes:
     """
     Decrypt an encrypted message payload.
@@ -317,32 +318,28 @@ def decrypt_message(
         encryption_key: 16-byte session key.
         nonce: 12-byte nonce from packet header.
         ciphertext: Encrypted message with GCM tag.
-        masked_header: Masked header bytes (used as AAD).
+        message_ad: Additional authenticated data (masking-iv || plaintext header).
 
     Returns:
         Decrypted message plaintext.
     """
-    return aes_gcm_decrypt(encryption_key, bytes(nonce), ciphertext, masked_header)
+    return aes_gcm_decrypt(encryption_key, Bytes12(nonce), ciphertext, message_ad)
 
 
-def encode_message_authdata(src_id: bytes) -> bytes:
+def encode_message_authdata(src_id: NodeId) -> bytes:
     """Encode MESSAGE packet authdata."""
-    if len(src_id) != 32:
-        raise ValueError(f"Source ID must be 32 bytes, got {len(src_id)}")
     return src_id
 
 
-def encode_whoareyou_authdata(id_nonce: bytes, enr_seq: int) -> bytes:
+def encode_whoareyou_authdata(id_nonce: IdNonce, enr_seq: SeqNumber) -> bytes:
     """Encode WHOAREYOU packet authdata."""
-    if len(id_nonce) != 16:
-        raise ValueError(f"ID nonce must be 16 bytes, got {len(id_nonce)}")
     return id_nonce + struct.pack(">Q", enr_seq)
 
 
 def encode_handshake_authdata(
-    src_id: bytes,
-    id_signature: bytes,
-    eph_pubkey: bytes,
+    src_id: NodeId,
+    id_signature: Bytes64,
+    eph_pubkey: Bytes33,
     record: bytes | None = None,
 ) -> bytes:
     """
@@ -357,15 +354,6 @@ def encode_handshake_authdata(
     Returns:
         Encoded authdata bytes.
     """
-    if len(src_id) != 32:
-        raise ValueError(f"Source ID must be 32 bytes, got {len(src_id)}")
-    if len(id_signature) != ID_SIGNATURE_SIZE:
-        raise ValueError(f"Signature must be {ID_SIGNATURE_SIZE} bytes, got {len(id_signature)}")
-    if len(eph_pubkey) != COMPRESSED_PUBKEY_SIZE:
-        raise ValueError(
-            f"Ephemeral pubkey must be {COMPRESSED_PUBKEY_SIZE} bytes, got {len(eph_pubkey)}"
-        )
-
     authdata = src_id + bytes([len(id_signature), len(eph_pubkey)]) + id_signature + eph_pubkey
 
     if record is not None:
@@ -374,17 +362,7 @@ def encode_handshake_authdata(
     return authdata
 
 
-def generate_nonce() -> Nonce:
-    """Generate a random 12-byte message nonce."""
-    return Nonce(os.urandom(GCM_NONCE_SIZE))
-
-
-def generate_id_nonce() -> IdNonce:
-    """Generate a random 16-byte identity challenge nonce."""
-    return IdNonce(os.urandom(16))
-
-
-def _encode_static_header(flag: PacketFlag, nonce: bytes, authdata_size: int) -> bytes:
+def encode_static_header(flag: PacketFlag, nonce: Nonce, authdata_size: int) -> bytes:
     """Encode the 23-byte static header."""
     return (
         PROTOCOL_ID

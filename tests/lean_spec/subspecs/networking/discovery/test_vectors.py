@@ -9,6 +9,12 @@ Reference:
 
 from __future__ import annotations
 
+import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
+from lean_spec.subspecs.networking.discovery.codec import decode_message, encode_message
 from lean_spec.subspecs.networking.discovery.crypto import (
     aes_gcm_decrypt,
     aes_gcm_encrypt,
@@ -20,43 +26,73 @@ from lean_spec.subspecs.networking.discovery.keys import (
     compute_node_id,
     derive_keys,
 )
-from lean_spec.subspecs.networking.discovery.messages import PacketFlag
+from lean_spec.subspecs.networking.discovery.messages import (
+    Distance,
+    FindNode,
+    IdNonce,
+    IPv4,
+    MessageType,
+    Nodes,
+    Nonce,
+    PacketFlag,
+    Ping,
+    Pong,
+    Port,
+    RequestId,
+)
 from lean_spec.subspecs.networking.discovery.packet import (
+    HANDSHAKE_HEADER_SIZE,
+    STATIC_HEADER_SIZE,
+    WHOAREYOU_AUTHDATA_SIZE,
     decode_handshake_authdata,
     decode_message_authdata,
     decode_packet_header,
     decode_whoareyou_authdata,
+    decrypt_message,
     encode_handshake_authdata,
     encode_message_authdata,
     encode_packet,
     encode_whoareyou_authdata,
 )
+from lean_spec.subspecs.networking.discovery.routing import log2_distance, xor_distance
+from lean_spec.subspecs.networking.types import SeqNumber
+from lean_spec.types import Bytes12, Bytes16, Bytes32, Bytes33, Bytes64
+from lean_spec.types.uint import Uint8
+from tests.lean_spec.helpers import make_challenge_data
+from tests.lean_spec.subspecs.networking.discovery.conftest import (
+    NODE_A_ID,
+    NODE_A_PRIVKEY,
+    NODE_B_ID,
+    NODE_B_PRIVKEY,
+    NODE_B_PUBKEY,
+    SPEC_ID_NONCE,
+)
 
-# ==============================================================================
-# Test Node Keys (from devp2p spec)
-# ==============================================================================
+# Spec test vector values for ECDH and key derivation.
+SPEC_NONCE = Nonce(bytes.fromhex("0102030405060708090a0b0c"))
+SPEC_CHALLENGE_DATA = bytes.fromhex(
+    "000000000000000000000000000000006469736376350001010102030405060708090a0b0c"
+    "00180102030405060708090a0b0c0d0e0f100000000000000000"
+)
 
-# Node B's secp256k1 keypair (from devp2p spec)
-# Node B's private key is provided in the test vectors.
-NODE_B_PRIVKEY = bytes.fromhex("66fb62bfbd66b9177a138c1e5cddbe4f7c30c343e94e68df8769459cb1cde628")
-NODE_B_ID = bytes.fromhex("bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9")
+# Spec ephemeral keypair for ECDH / ID nonce signing.
+SPEC_EPHEMERAL_KEY = Bytes32(
+    bytes.fromhex("fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
+)
+SPEC_EPHEMERAL_PUBKEY = Bytes33(
+    bytes.fromhex("039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231")
+)
 
-# Node A's ID (from devp2p spec, private key not provided)
-NODE_A_ID = bytes.fromhex("aaaa8419e9f49d0083561b48287df592939a8d19947d8c0ef88f2a4856a69fbb")
+# Derived session keys from spec HKDF test vector.
+SPEC_INITIATOR_KEY = Bytes16(bytes.fromhex("dccc82d81bd610f4f76d3ebe97a40571"))
+SPEC_RECIPIENT_KEY = Bytes16(bytes.fromhex("ac74bb8773749920b0d3a8881c173ec5"))
 
+# AES-GCM test vector values.
+SPEC_AES_KEY = Bytes16(bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b"))
+SPEC_AES_NONCE = Bytes12(bytes.fromhex("27b5af763c446acd2749fe8e"))
 
-def make_challenge_data(id_nonce: bytes = bytes(16)) -> bytes:
-    """Build mock challenge_data for testing.
-
-    Format: masking-iv (16) + static-header (23) + authdata (24) = 63 bytes.
-    The authdata contains the id_nonce (16) + enr_seq (8).
-    """
-    masking_iv = bytes(16)
-    # static-header: protocol-id (6) + version (2) + flag (1) + nonce (12) + authdata-size (2)
-    static_header = b"discv5" + b"\x00\x01\x01" + bytes(12) + b"\x00\x18"
-    # authdata: id-nonce (16) + enr-seq (8)
-    authdata = id_nonce + bytes(8)
-    return masking_iv + static_header + authdata
+# PING message plaintext (type 0x01, RLP [1]).
+SPEC_PING_PLAINTEXT = bytes.fromhex("01c20101")
 
 
 class TestOfficialNodeIdVectors:
@@ -69,21 +105,62 @@ class TestOfficialNodeIdVectors:
         We derive the public key from the private key since the spec
         provides the private key for Node B.
         """
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-
         # Derive public key from private key.
         private_key = ec.derive_private_key(
             int.from_bytes(NODE_B_PRIVKEY, "big"),
             ec.SECP256K1(),
         )
-        pubkey_bytes = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.X962,
-            format=serialization.PublicFormat.CompressedPoint,
+        pubkey_bytes = Bytes33(
+            private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.X962,
+                format=serialization.PublicFormat.CompressedPoint,
+            )
         )
 
         computed = compute_node_id(pubkey_bytes)
         assert bytes(computed) == NODE_B_ID
+
+
+class TestOfficialNodeIdAndKeyVectors:
+    """Verify both node IDs and bidirectional ECDH from spec key material."""
+
+    def test_node_a_id_from_privkey(self):
+        """Node A's ID from its private key matches the spec vector."""
+        private_key = ec.derive_private_key(
+            int.from_bytes(NODE_A_PRIVKEY, "big"),
+            ec.SECP256K1(),
+        )
+        pubkey_bytes = Bytes33(
+            private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.X962,
+                format=serialization.PublicFormat.CompressedPoint,
+            )
+        )
+        computed = compute_node_id(pubkey_bytes)
+        assert bytes(computed) == NODE_A_ID
+
+    def test_bidirectional_ecdh(self):
+        """ECDH(A_priv, B_pub) == ECDH(B_priv, A_pub).
+
+        Derives Node A's public key from its private key and verifies
+        that both sides compute the same shared secret.
+        """
+        # Derive Node A's public key from its private key.
+        a_privkey = ec.derive_private_key(
+            int.from_bytes(NODE_A_PRIVKEY, "big"),
+            ec.SECP256K1(),
+        )
+        a_pubkey_bytes = Bytes33(
+            a_privkey.public_key().public_bytes(
+                encoding=serialization.Encoding.X962,
+                format=serialization.PublicFormat.CompressedPoint,
+            )
+        )
+
+        shared_ab = ecdh_agree(NODE_A_PRIVKEY, NODE_B_PUBKEY)
+        shared_ba = ecdh_agree(NODE_B_PRIVKEY, a_pubkey_bytes)
+
+        assert shared_ab == shared_ba
 
 
 class TestOfficialCryptoVectors:
@@ -93,84 +170,36 @@ class TestOfficialCryptoVectors:
         """
         ECDH between Node A's private key and Node B's public key.
 
-        Per spec, the shared secret is the x-coordinate of the ECDH point.
+        Per spec, the shared secret is the 33-byte compressed point.
         """
-        # Test vector values
-        secret_key = bytes.fromhex(
-            "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
-        )
-        public_key = bytes.fromhex(
-            "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231"
-        )
         expected_shared = bytes.fromhex(
             "033b11a2a1f214567e1537ce5e509ffd9b21373247f2a3ff6841f4976f53165e7e"
         )
 
-        shared = ecdh_agree(secret_key, public_key)
+        shared = ecdh_agree(SPEC_EPHEMERAL_KEY, SPEC_EPHEMERAL_PUBKEY)
 
-        # The ECDH result is the 32-byte x-coordinate.
-        # Expected includes compressed point prefix, strip it.
-        assert bytes(shared) == expected_shared[1:]
+        assert shared == expected_shared
 
     def test_key_derivation_hkdf(self):
         """
         Key derivation using HKDF-SHA256.
 
         Derives initiator_key and recipient_key from ECDH shared secret.
-
-        Note: The official spec uses challenge-data (full WHOAREYOU packet)
-        as the HKDF salt. Our implementation uses just the id-nonce for
-        simplicity while maintaining the security properties. This test
-        verifies our key derivation produces consistent, deterministic output.
+        Uses exact spec challenge_data (with nonce 0102030405060708090a0b0c).
         """
-        ephemeral_key = bytes.fromhex(
-            "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
-        )
-        dest_pubkey = bytes.fromhex(
-            "0317931e6e0840220642f230037d285d122bc59063221ef3226b1f403ddc69ca91"
-        )
-        node_id_a = bytes.fromhex(
-            "aaaa8419e9f49d0083561b48287df592939a8d19947d8c0ef88f2a4856a69fbb"
-        )
-        node_id_b = bytes.fromhex(
-            "bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9"
-        )
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-
-        # Build challenge_data per spec: masking-iv || static-header || authdata
-        # For WHOAREYOU: authdata = id-nonce (16) + enr-seq (8)
-        masking_iv = bytes(16)  # Mock masking IV
-        static_header = b"discv5" + b"\x00\x01\x01" + bytes(12) + b"\x00\x18"  # 23 bytes
-        authdata = id_nonce + bytes(8)  # id-nonce + enr-seq
-        challenge_data = masking_iv + static_header + authdata
-
         # Compute ECDH shared secret.
-        shared_secret = ecdh_agree(ephemeral_key, dest_pubkey)
+        shared_secret = ecdh_agree(SPEC_EPHEMERAL_KEY, NODE_B_PUBKEY)
 
-        # Derive keys.
+        # Derive keys using exact spec challenge_data.
         initiator_key, recipient_key = derive_keys(
-            secret=bytes(shared_secret),
-            initiator_id=node_id_a,
-            recipient_id=node_id_b,
-            challenge_data=challenge_data,
+            secret=shared_secret,
+            initiator_id=NODE_A_ID,
+            recipient_id=NODE_B_ID,
+            challenge_data=SPEC_CHALLENGE_DATA,
         )
 
-        # Verify keys are 16 bytes each.
-        assert len(initiator_key) == 16
-        assert len(recipient_key) == 16
-
-        # Verify keys are different from each other.
-        assert initiator_key != recipient_key
-
-        # Verify determinism: same inputs produce same outputs.
-        init2, recv2 = derive_keys(
-            secret=bytes(shared_secret),
-            initiator_id=node_id_a,
-            recipient_id=node_id_b,
-            challenge_data=challenge_data,
-        )
-        assert initiator_key == init2
-        assert recipient_key == recv2
+        assert initiator_key == SPEC_INITIATOR_KEY
+        assert recipient_key == SPEC_RECIPIENT_KEY
 
     def test_id_nonce_signature(self):
         """
@@ -181,30 +210,25 @@ class TestOfficialCryptoVectors:
                                 ephemeral-pubkey || node-id-B
             signature = sign(sha256(id-signature-input))
 
-        Note: The expected signature from the spec may use a different
-        signing implementation. ECDSA signatures can have valid variations
-        due to nonce randomness. We verify our signature is valid.
+        Uses exact spec challenge_data and verifies byte-exact signature output.
         """
-        static_key = bytes.fromhex(
-            "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
-        )
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        ephemeral_pubkey = bytes.fromhex(
-            "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231"
-        )
-        node_id_b = bytes.fromhex(
-            "bbbb9d047f0488c0b5a93c1c3f2d8bafc7c8ff337024a55434a0d0555de64db9"
+        # Sign using exact spec challenge_data.
+        signature = sign_id_nonce(
+            private_key_bytes=SPEC_EPHEMERAL_KEY,
+            challenge_data=SPEC_CHALLENGE_DATA,
+            ephemeral_pubkey=SPEC_EPHEMERAL_PUBKEY,
+            dest_node_id=NODE_B_ID,
         )
 
-        # Build challenge_data from id_nonce.
-        challenge_data = make_challenge_data(id_nonce)
+        expected_sig = bytes.fromhex(
+            "94852a1e2318c4e5e9d422c98eaf19d1d90d876b29cd06ca7cb7546d0fff7b48"
+            "4fe86c09a064fe72bdbef73ba8e9c34df0cd2b53e9d65528c2c7f336d5dfc6e6"
+        )
+        assert signature == expected_sig
 
-        # Derive public key from private key.
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-
+        # Also verify the signature.
         private_key = ec.derive_private_key(
-            int.from_bytes(static_key, "big"),
+            int.from_bytes(SPEC_EPHEMERAL_KEY, "big"),
             ec.SECP256K1(),
         )
         pubkey_bytes = private_key.public_key().public_bytes(
@@ -212,38 +236,31 @@ class TestOfficialCryptoVectors:
             format=serialization.PublicFormat.CompressedPoint,
         )
 
-        # Sign using full challenge_data.
-        signature = sign_id_nonce(
-            private_key_bytes=static_key,
-            challenge_data=challenge_data,
-            ephemeral_pubkey=ephemeral_pubkey,
-            dest_node_id=node_id_b,
-        )
-
-        assert len(signature) == 64
-
-        # Verify our signature is valid.
         assert verify_id_nonce_signature(
-            signature=signature,
-            challenge_data=challenge_data,
-            ephemeral_pubkey=ephemeral_pubkey,
-            dest_node_id=node_id_b,
-            public_key_bytes=pubkey_bytes,
+            signature=Bytes64(signature),
+            challenge_data=SPEC_CHALLENGE_DATA,
+            ephemeral_pubkey=SPEC_EPHEMERAL_PUBKEY,
+            dest_node_id=NODE_B_ID,
+            public_key_bytes=Bytes33(pubkey_bytes),
         )
 
     def test_id_nonce_signature_different_challenge_data(self):
         """Different challenge_data produces different signatures."""
-        static_key = NODE_B_PRIVKEY
-        ephemeral_pubkey = bytes.fromhex(
-            "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231"
-        )
-        node_id = NODE_A_ID
-
         challenge_data1 = make_challenge_data(bytes(16))
         challenge_data2 = make_challenge_data(bytes([1]) + bytes(15))
 
-        sig1 = sign_id_nonce(static_key, challenge_data1, ephemeral_pubkey, node_id)
-        sig2 = sign_id_nonce(static_key, challenge_data2, ephemeral_pubkey, node_id)
+        sig1 = sign_id_nonce(
+            NODE_B_PRIVKEY,
+            challenge_data1,
+            SPEC_EPHEMERAL_PUBKEY,
+            NODE_A_ID,
+        )
+        sig2 = sign_id_nonce(
+            NODE_B_PRIVKEY,
+            challenge_data2,
+            SPEC_EPHEMERAL_PUBKEY,
+            NODE_A_ID,
+        )
 
         assert sig1 != sig2
 
@@ -253,113 +270,135 @@ class TestOfficialCryptoVectors:
 
         The 16-byte authentication tag is appended to ciphertext.
         """
-        encryption_key = bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b")
-        nonce = bytes.fromhex("27b5af763c446acd2749fe8e")
-        plaintext = bytes.fromhex("01c20101")
         aad = bytes.fromhex("93a7400fa0d6a694ebc24d5cf570f65d04215b6ac00757875e3f3a5f42107903")
         expected_ciphertext = bytes.fromhex("a5d12a2d94b8ccb3ba55558229867dc13bfa3648")
 
         # Encrypt.
-        ciphertext = aes_gcm_encrypt(encryption_key, nonce, plaintext, aad)
+        ciphertext = aes_gcm_encrypt(SPEC_AES_KEY, SPEC_AES_NONCE, SPEC_PING_PLAINTEXT, aad)
 
         assert ciphertext == expected_ciphertext
 
         # Verify decryption works.
-        decrypted = aes_gcm_decrypt(encryption_key, nonce, ciphertext, aad)
-        assert decrypted == plaintext
+        decrypted = aes_gcm_decrypt(SPEC_AES_KEY, SPEC_AES_NONCE, ciphertext, aad)
+        assert decrypted == SPEC_PING_PLAINTEXT
 
 
 class TestOfficialPacketVectors:
-    """
-    Packet encoding test vectors from devp2p spec.
+    """Decode exact packet bytes from the devp2p spec test vectors.
 
-    Note: Full packet encoding verification requires deterministic masking IV,
-    which the spec test vectors use all-zeros IV for reproducibility.
-    These tests verify the underlying authdata encoding is correct.
+    These tests verify interoperability by decoding the spec's exact hex packets.
     """
 
-    def test_message_authdata_encoding(self):
-        """MESSAGE packet authdata is just the 32-byte source node ID."""
-        src_id = NODE_A_ID
+    def test_decode_spec_ping_packet(self):
+        """Decode the exact Ping packet from the spec test vectors.
 
-        authdata = encode_message_authdata(src_id)
-        assert authdata == src_id
-        assert len(authdata) == 32
+        Verifies header fields and decrypts the message payload.
+        """
+        packet_hex = (
+            "00000000000000000000000000000000088b3d4342774649325f313964a39e55"
+            "ea96c005ad52be8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d3"
+            "4c4f53245d08dab84102ed931f66d1492acb308fa1c6715b9d139b81acbdcc"
+        )
+        packet = bytes.fromhex(packet_hex)
 
-        # Decode and verify.
-        decoded = decode_message_authdata(authdata)
-        assert decoded.src_id == src_id
+        header, ciphertext, message_ad = decode_packet_header(NODE_B_ID, packet)
 
-    def test_whoareyou_authdata_encoding(self):
-        """WHOAREYOU authdata is id-nonce (16) + enr-seq (8)."""
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        enr_seq = 0
+        assert header.flag == PacketFlag.MESSAGE
+        decoded_authdata = decode_message_authdata(header.authdata)
+        assert decoded_authdata.src_id == NODE_A_ID
 
-        authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
-        assert len(authdata) == 24
+        # Decrypt using the spec's read-key (all zeros for this test vector).
+        read_key = Bytes16(bytes(16))
+        plaintext = decrypt_message(read_key, header.nonce, ciphertext, message_ad)
 
-        # Decode and verify.
-        decoded = decode_whoareyou_authdata(authdata)
-        assert bytes(decoded.id_nonce) == id_nonce
-        assert int(decoded.enr_seq) == enr_seq
+        # PING with request-id=0x00000001 (4 bytes) and enr-seq=2.
+        decoded = decode_message(plaintext)
+        assert isinstance(decoded, Ping)
+        assert int(decoded.enr_seq) == 2
 
-    def test_whoareyou_authdata_with_nonzero_enr_seq(self):
-        """WHOAREYOU with known ENR sequence."""
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        enr_seq = 1
+    def test_decode_spec_whoareyou_packet(self):
+        """Decode the exact WHOAREYOU packet from the spec test vectors.
 
-        authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
+        Verifies id-nonce and enr-seq match expected values.
+        Per spec, the WHOAREYOU dest-node-id is Node B's ID.
+        """
+        packet_hex = (
+            "00000000000000000000000000000000088b3d434277464933a1ccc59f5967ad"
+            "1d6035f15e528627dde75cd68292f9e6c27d6b66c8100a873fcbaed4e16b8d"
+        )
+        packet = bytes.fromhex(packet_hex)
 
-        decoded = decode_whoareyou_authdata(authdata)
+        header, _message, _message_ad = decode_packet_header(NODE_B_ID, packet)
+
+        assert header.flag == PacketFlag.WHOAREYOU
+        decoded_authdata = decode_whoareyou_authdata(header.authdata)
+        assert bytes(decoded_authdata.id_nonce) == SPEC_ID_NONCE
+        assert int(decoded_authdata.enr_seq) == 0
+
+    def test_decode_spec_handshake_packet(self):
+        """Decode the exact Handshake packet (no ENR) from the spec test vectors.
+
+        Verifies authdata fields (src-id, signature size, key size).
+        """
+        packet_hex = (
+            "00000000000000000000000000000000088b3d4342774649305f313964a39e55"
+            "ea96c005ad521d8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d3"
+            "4c4f53245d08da4bb252012b2cba3f4f374a90a75cff91f142fa9be3e0a5f3ef"
+            "268ccb9065aeecfd67a999e7fdc137e062b2ec4a0eb92947f0d9a74bfbf44dfb"
+            "a776b21301f8b65efd5796706adff216ab862a9186875f9494150c4ae06fa4d1"
+            "f0396c93f215fa4ef524f1eadf5f0f4126b79336671cbcf7a885b1f8bd2a5d83"
+            "9cf8"
+        )
+        packet = bytes.fromhex(packet_hex)
+
+        header, _ciphertext, _message_ad = decode_packet_header(NODE_B_ID, packet)
+
+        assert header.flag == PacketFlag.HANDSHAKE
+        decoded_authdata = decode_handshake_authdata(header.authdata)
+        assert decoded_authdata.src_id == NODE_A_ID
+        assert decoded_authdata.sig_size == 64
+        assert decoded_authdata.eph_key_size == 33
+
+    def test_decode_spec_handshake_with_enr_packet(self):
+        """Decode the exact Handshake-with-ENR packet from the spec test vectors.
+
+        Verifies authdata fields and presence of embedded ENR record.
+        """
+        packet_hex = (
+            "00000000000000000000000000000000088b3d4342774649305f313964a39e55"
+            "ea96c005ad539c8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d3"
+            "4c4f53245d08da4bb23698868350aaad22e3ab8dd034f548a1c43cd246be9856"
+            "2fafa0a1fa86d8e7a3b95ae78cc2b988ded6a5b59eb83ad58097252188b902b2"
+            "1481e30e5e285f19735796706adff216ab862a9186875f9494150c4ae06fa4d1"
+            "f0396c93f215fa4ef524e0ed04c3c21e39b1868e1ca8105e585ec17315e755e6"
+            "cfc4dd6cb7fd8e1a1f55e49b4b5eb024221482105346f3c82b15fdaae36a3bb1"
+            "2a494683b4a3c7f2ae41306252fed84785e2bbff3b022812d0882f06978df84a"
+            "80d443972213342d04b9048fc3b1d5fcb1df0f822152eced6da4d3f6df27e70e"
+            "4539717307a0208cd208d65093ccab5aa596a34d7511401987662d8cf62b1394"
+            "71"
+        )
+        packet = bytes.fromhex(packet_hex)
+
+        header, ciphertext, message_ad = decode_packet_header(NODE_B_ID, packet)
+
+        assert header.flag == PacketFlag.HANDSHAKE
+        decoded_authdata = decode_handshake_authdata(header.authdata)
+        assert decoded_authdata.src_id == NODE_A_ID
+        assert decoded_authdata.sig_size == 64
+        assert decoded_authdata.eph_key_size == 33
+
+        # This packet includes an ENR record (unlike the no-ENR handshake).
+        assert decoded_authdata.record is not None
+        assert len(decoded_authdata.record) > 0
+
+        # Decrypt the message using the spec's read-key.
+        read_key = Bytes16(bytes.fromhex("53b1c075f41876423154e157470c2f48"))
+        plaintext = decrypt_message(read_key, header.nonce, ciphertext, message_ad)
+
+        # PING with request-id=0x00000001 and enr-seq=1.
+        decoded = decode_message(plaintext)
+        assert isinstance(decoded, Ping)
         assert int(decoded.enr_seq) == 1
-
-    def test_handshake_authdata_encoding(self):
-        """HANDSHAKE authdata contains signature and ephemeral key."""
-        src_id = NODE_A_ID
-        id_signature = bytes(64)  # Placeholder 64-byte signature.
-        eph_pubkey = bytes.fromhex(
-            "039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5"
-        )
-
-        authdata = encode_handshake_authdata(
-            src_id=src_id,
-            id_signature=id_signature,
-            eph_pubkey=eph_pubkey,
-            record=None,
-        )
-
-        # Expected size: 32 (src_id) + 1 (sig_size) + 1 (key_size) + 64 + 33 = 131
-        assert len(authdata) == 131
-
-        # Decode and verify.
-        decoded = decode_handshake_authdata(authdata)
-        assert decoded.src_id == src_id
-        assert decoded.sig_size == 64
-        assert decoded.eph_key_size == 33
-        assert decoded.id_signature == id_signature
-        assert decoded.eph_pubkey == eph_pubkey
-        assert decoded.record is None
-
-    def test_handshake_authdata_with_enr(self):
-        """HANDSHAKE authdata can include an ENR record."""
-        src_id = NODE_A_ID
-        id_signature = bytes(64)
-        eph_pubkey = bytes.fromhex(
-            "039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5"
-        )
-        # Minimal valid RLP-encoded ENR (just for testing).
-        enr_record = bytes.fromhex("f84180")  # Placeholder.
-
-        authdata = encode_handshake_authdata(
-            src_id=src_id,
-            id_signature=id_signature,
-            eph_pubkey=eph_pubkey,
-            record=enr_record,
-        )
-
-        # Decode and verify.
-        decoded = decode_handshake_authdata(authdata)
-        assert decoded.record == enr_record
 
 
 class TestPacketEncodingRoundtrip:
@@ -367,17 +406,14 @@ class TestPacketEncodingRoundtrip:
 
     def test_message_packet_roundtrip(self):
         """MESSAGE packet encodes and decodes correctly."""
-        src_id = NODE_A_ID
-        dest_id = NODE_B_ID
-        nonce = bytes(12)  # 12-byte nonce.
-        encryption_key = bytes(16)  # 16-byte key.
+        nonce = Nonce(bytes(12))  # 12-byte nonce.
+        encryption_key = Bytes16(bytes(16))  # 16-byte key.
         message = b"\x01\xc2\x01\x01"  # PING message.
 
-        authdata = encode_message_authdata(src_id)
+        authdata = encode_message_authdata(NODE_A_ID)
 
         packet = encode_packet(
-            dest_node_id=dest_id,
-            src_node_id=src_id,
+            dest_node_id=NODE_B_ID,
             flag=PacketFlag.MESSAGE,
             nonce=nonce,
             authdata=authdata,
@@ -386,27 +422,24 @@ class TestPacketEncodingRoundtrip:
         )
 
         # Decode header.
-        header, ciphertext = decode_packet_header(dest_id, packet)
+        header, ciphertext, _message_ad = decode_packet_header(NODE_B_ID, packet)
 
         assert header.flag == PacketFlag.MESSAGE
         assert len(header.authdata) == 32
 
         decoded_authdata = decode_message_authdata(header.authdata)
-        assert decoded_authdata.src_id == src_id
+        assert decoded_authdata.src_id == NODE_A_ID
 
     def test_whoareyou_packet_roundtrip(self):
         """WHOAREYOU packet encodes and decodes correctly."""
-        src_id = NODE_A_ID
-        dest_id = NODE_B_ID
-        nonce = bytes.fromhex("0102030405060708090a0b0c")
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        enr_seq = 0
+        nonce = Nonce(bytes.fromhex("0102030405060708090a0b0c"))
+        id_nonce = IdNonce(bytes.fromhex("0102030405060708090a0b0c0d0e0f10"))
+        enr_seq = SeqNumber(0)
 
         authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
 
         packet = encode_packet(
-            dest_node_id=dest_id,
-            src_node_id=src_id,
+            dest_node_id=NODE_B_ID,
             flag=PacketFlag.WHOAREYOU,
             nonce=nonce,
             authdata=authdata,
@@ -415,100 +448,49 @@ class TestPacketEncodingRoundtrip:
         )
 
         # Decode header.
-        header, message = decode_packet_header(dest_id, packet)
+        header, message, _message_ad = decode_packet_header(NODE_B_ID, packet)
 
         assert header.flag == PacketFlag.WHOAREYOU
         assert bytes(header.nonce) == nonce
 
         decoded_authdata = decode_whoareyou_authdata(header.authdata)
         assert bytes(decoded_authdata.id_nonce) == id_nonce
-        assert int(decoded_authdata.enr_seq) == enr_seq
+        assert decoded_authdata.enr_seq == enr_seq
 
     def test_handshake_packet_roundtrip(self):
         """HANDSHAKE packet encodes and decodes correctly."""
-        src_id = NODE_A_ID
-        dest_id = NODE_B_ID
-        nonce = bytes(12)
-        encryption_key = bytes.fromhex("dccc82d81bd610f4f76d3ebe97a40571")
+        nonce = Nonce(bytes(12))
         message = b"\x01\xc2\x01\x01"  # PING message.
 
-        id_signature = bytes(64)
-        eph_pubkey = bytes.fromhex(
-            "039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5"
+        id_signature = Bytes64(bytes(64))
+        eph_pubkey = Bytes33(
+            bytes.fromhex("039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5")
         )
 
         authdata = encode_handshake_authdata(
-            src_id=src_id,
+            src_id=NODE_A_ID,
             id_signature=id_signature,
             eph_pubkey=eph_pubkey,
             record=None,
         )
 
         packet = encode_packet(
-            dest_node_id=dest_id,
-            src_node_id=src_id,
+            dest_node_id=NODE_B_ID,
             flag=PacketFlag.HANDSHAKE,
             nonce=nonce,
             authdata=authdata,
             message=message,
-            encryption_key=encryption_key,
+            encryption_key=SPEC_INITIATOR_KEY,
         )
 
         # Decode header.
-        header, ciphertext = decode_packet_header(dest_id, packet)
+        header, ciphertext, _message_ad = decode_packet_header(NODE_B_ID, packet)
 
         assert header.flag == PacketFlag.HANDSHAKE
 
         decoded_authdata = decode_handshake_authdata(header.authdata)
-        assert decoded_authdata.src_id == src_id
+        assert decoded_authdata.src_id == NODE_A_ID
         assert decoded_authdata.eph_pubkey == eph_pubkey
-
-
-class TestKeyDerivationEdgeCases:
-    """Additional key derivation tests beyond official vectors."""
-
-    def test_derive_keys_deterministic(self):
-        """Same inputs always produce same keys."""
-        secret = bytes(32)
-        initiator_id = NODE_A_ID
-        recipient_id = NODE_B_ID
-        challenge_data = make_challenge_data()
-
-        keys1 = derive_keys(secret, initiator_id, recipient_id, challenge_data)
-        keys2 = derive_keys(secret, initiator_id, recipient_id, challenge_data)
-
-        assert keys1 == keys2
-
-    def test_derive_keys_id_order_matters(self):
-        """Swapping initiator/recipient produces different keys."""
-        secret = bytes(32)
-        id_a = NODE_A_ID
-        id_b = NODE_B_ID
-        challenge_data = make_challenge_data()
-
-        keys_ab = derive_keys(secret, id_a, id_b, challenge_data)
-        keys_ba = derive_keys(secret, id_b, id_a, challenge_data)
-
-        assert keys_ab != keys_ba
-
-    def test_derive_keys_challenge_data_matters(self):
-        """Different challenge_data produces different keys."""
-        secret = bytes(32)
-        initiator_id = NODE_A_ID
-        recipient_id = NODE_B_ID
-
-        challenge_data1 = make_challenge_data(bytes(16))
-        challenge_data2 = make_challenge_data(bytes([1]) + bytes(15))
-
-        keys1 = derive_keys(secret, initiator_id, recipient_id, challenge_data1)
-        keys2 = derive_keys(secret, initiator_id, recipient_id, challenge_data2)
-
-        assert keys1 != keys2
-
-
-# ==============================================================================
-# Phase 1: Official Spec Test Vectors (devp2p wire test vectors)
-# ==============================================================================
 
 
 class TestOfficialPacketEncoding:
@@ -527,14 +509,10 @@ class TestOfficialPacketEncoding:
         PING format: [request-id, enr-seq]
         Message type byte 0x01 prepended.
         """
-        from lean_spec.subspecs.networking.discovery.codec import encode_message
-        from lean_spec.subspecs.networking.discovery.messages import MessageType, Ping, RequestId
-        from lean_spec.types import Uint64
-
         # PING with request ID [0x00, 0x00, 0x00, 0x01] and enr_seq = 1
         ping = Ping(
             request_id=RequestId(data=b"\x00\x00\x00\x01"),
-            enr_seq=Uint64(1),
+            enr_seq=SeqNumber(1),
         )
 
         encoded = encode_message(ping)
@@ -552,19 +530,10 @@ class TestOfficialPacketEncoding:
         PONG format: [request-id, enr-seq, recipient-ip, recipient-port]
         Message type byte 0x02 prepended.
         """
-        from lean_spec.subspecs.networking.discovery.codec import encode_message
-        from lean_spec.subspecs.networking.discovery.messages import (
-            MessageType,
-            Pong,
-            Port,
-            RequestId,
-        )
-        from lean_spec.types import Uint64
-
         pong = Pong(
             request_id=RequestId(data=b"\x00\x00\x00\x01"),
-            enr_seq=Uint64(1),
-            recipient_ip=b"\x7f\x00\x00\x01",  # 127.0.0.1
+            enr_seq=SeqNumber(1),
+            recipient_ip=IPv4(b"\x7f\x00\x00\x01"),  # 127.0.0.1
             recipient_port=Port(30303),
         )
 
@@ -580,14 +549,6 @@ class TestOfficialPacketEncoding:
         FINDNODE format: [request-id, [distances...]]
         Message type byte 0x03 prepended.
         """
-        from lean_spec.subspecs.networking.discovery.codec import encode_message
-        from lean_spec.subspecs.networking.discovery.messages import (
-            Distance,
-            FindNode,
-            MessageType,
-            RequestId,
-        )
-
         findnode = FindNode(
             request_id=RequestId(data=b"\x00\x00\x00\x01"),
             distances=[Distance(256), Distance(255)],
@@ -605,14 +566,6 @@ class TestOfficialPacketEncoding:
         NODES format: [request-id, total, [enrs...]]
         Message type byte 0x04 prepended.
         """
-        from lean_spec.subspecs.networking.discovery.codec import encode_message
-        from lean_spec.subspecs.networking.discovery.messages import (
-            MessageType,
-            Nodes,
-            RequestId,
-        )
-        from lean_spec.types.uint import Uint8
-
         nodes = Nodes(
             request_id=RequestId(data=b"\x00\x00\x00\x01"),
             total=Uint8(1),
@@ -640,23 +593,14 @@ class TestOfficialPacketEncoding:
         - nonce: 12 bytes
         - authdata-size: 2 bytes
         """
-        from lean_spec.subspecs.networking.discovery.packet import (
-            STATIC_HEADER_SIZE,
-            encode_message_authdata,
-            encode_packet,
-        )
-
-        src_id = NODE_A_ID
-        dest_id = NODE_B_ID
-        nonce = bytes(12)
-        encryption_key = bytes(16)
+        nonce = Nonce(bytes(12))
+        encryption_key = Bytes16(bytes(16))
         message = b"\x01\xc2\x01\x01"
 
-        authdata = encode_message_authdata(src_id)
+        authdata = encode_message_authdata(NODE_A_ID)
 
         packet = encode_packet(
-            dest_node_id=dest_id,
-            src_node_id=src_id,
+            dest_node_id=NODE_B_ID,
             flag=PacketFlag.MESSAGE,
             nonce=nonce,
             authdata=authdata,
@@ -675,24 +619,14 @@ class TestOfficialPacketEncoding:
         - authdata: id-nonce (16) + enr-seq (8) = 24 bytes
         - no message payload
         """
-        from lean_spec.subspecs.networking.discovery.packet import (
-            STATIC_HEADER_SIZE,
-            WHOAREYOU_AUTHDATA_SIZE,
-            encode_packet,
-            encode_whoareyou_authdata,
-        )
-
-        src_id = NODE_A_ID
-        dest_id = NODE_B_ID
-        nonce = bytes(12)
-        id_nonce = bytes(16)
-        enr_seq = 0
+        nonce = Nonce(bytes(12))
+        id_nonce = IdNonce(bytes(16))
+        enr_seq = SeqNumber(0)
 
         authdata = encode_whoareyou_authdata(id_nonce, enr_seq)
 
         packet = encode_packet(
-            dest_node_id=dest_id,
-            src_node_id=src_id,
+            dest_node_id=NODE_B_ID,
             flag=PacketFlag.WHOAREYOU,
             nonce=nonce,
             authdata=authdata,
@@ -712,34 +646,24 @@ class TestOfficialPacketEncoding:
         - authdata: src-id (32) + sig-size (1) + eph-key-size (1) + sig + eph-key + [record]
         - encrypted message
         """
-        from lean_spec.subspecs.networking.discovery.packet import (
-            HANDSHAKE_HEADER_SIZE,
-            STATIC_HEADER_SIZE,
-            encode_handshake_authdata,
-            encode_packet,
-        )
-
-        src_id = NODE_A_ID
-        dest_id = NODE_B_ID
-        nonce = bytes(12)
-        encryption_key = bytes(16)
+        nonce = Nonce(bytes(12))
+        encryption_key = Bytes16(bytes(16))
         message = b"\x01\xc2\x01\x01"
 
-        id_signature = bytes(64)
-        eph_pubkey = bytes.fromhex(
-            "039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5"
+        id_signature = Bytes64(bytes(64))
+        eph_pubkey = Bytes33(
+            bytes.fromhex("039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5")
         )
 
         authdata = encode_handshake_authdata(
-            src_id=src_id,
+            src_id=NODE_A_ID,
             id_signature=id_signature,
             eph_pubkey=eph_pubkey,
             record=None,
         )
 
         packet = encode_packet(
-            dest_node_id=dest_id,
-            src_node_id=src_id,
+            dest_node_id=NODE_B_ID,
             flag=PacketFlag.HANDSHAKE,
             nonce=nonce,
             authdata=authdata,
@@ -760,95 +684,8 @@ class TestOfficialKeyDerivation:
     - salt: challenge-data (63 bytes)
     - IKM: secret || initiator-id || recipient-id
     - info: "discovery v5 key agreement"
-    - L: 32 bytes (2 × 16-byte keys)
+    - L: 32 bytes (2 x 16-byte keys)
     """
-
-    def test_key_derivation_structure_matches_spec(self):
-        """Key derivation produces keys in expected order.
-
-        Per spec:
-        - First 16 bytes: initiator-key (sender when we initiated)
-        - Last 16 bytes: recipient-key (receiver when we initiated)
-        """
-        ephemeral_key = bytes.fromhex(
-            "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
-        )
-        dest_pubkey = bytes.fromhex(
-            "0317931e6e0840220642f230037d285d122bc59063221ef3226b1f403ddc69ca91"
-        )
-        node_id_a = NODE_A_ID
-        node_id_b = NODE_B_ID
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-
-        challenge_data = make_challenge_data(id_nonce)
-        shared_secret = ecdh_agree(ephemeral_key, dest_pubkey)
-
-        initiator_key, recipient_key = derive_keys(
-            secret=bytes(shared_secret),
-            initiator_id=node_id_a,
-            recipient_id=node_id_b,
-            challenge_data=challenge_data,
-        )
-
-        # Both keys must be exactly 16 bytes (AES-128 key size).
-        assert len(initiator_key) == 16
-        assert len(recipient_key) == 16
-
-        # Keys must be different.
-        assert initiator_key != recipient_key
-
-    def test_id_signature_input_structure(self):
-        """ID signature input follows spec format.
-
-        Per spec:
-            id-signature-input = "discovery v5 identity proof" || challenge-data ||
-                                ephemeral-pubkey || node-id-B
-
-        The signature is ECDSA over SHA256(id-signature-input).
-        """
-        static_key = bytes.fromhex(
-            "fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736"
-        )
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        ephemeral_pubkey = bytes.fromhex(
-            "039961e4c2356d61bedb83052c115d311acb3a96f5777296dcf297351130266231"
-        )
-        node_id_b = NODE_B_ID
-
-        challenge_data = make_challenge_data(id_nonce)
-
-        # Signature should be deterministically verifiable.
-        signature = sign_id_nonce(
-            private_key_bytes=static_key,
-            challenge_data=challenge_data,
-            ephemeral_pubkey=ephemeral_pubkey,
-            dest_node_id=node_id_b,
-        )
-
-        # Signature is 64 bytes (r || s in compact form).
-        assert len(signature) == 64
-
-        # Derive public key for verification.
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
-
-        private_key = ec.derive_private_key(
-            int.from_bytes(static_key, "big"),
-            ec.SECP256K1(),
-        )
-        pubkey_bytes = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.X962,
-            format=serialization.PublicFormat.CompressedPoint,
-        )
-
-        # Verification must succeed.
-        assert verify_id_nonce_signature(
-            signature=signature,
-            challenge_data=challenge_data,
-            ephemeral_pubkey=ephemeral_pubkey,
-            dest_node_id=node_id_b,
-            public_key_bytes=pubkey_bytes,
-        )
 
     def test_challenge_data_format(self):
         """challenge_data follows spec format: masking-iv || static-header || authdata."""
@@ -883,127 +720,44 @@ class TestOfficialKeyDerivation:
         # Bytes 55-63: enr-seq (8 bytes, all zeros).
         assert challenge_data[55:63] == bytes(8)
 
-    def test_key_derivation_with_different_secrets_produces_different_keys(self):
-        """Different ECDH secrets produce completely different session keys."""
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        challenge_data = make_challenge_data(id_nonce)
-
-        secret1 = bytes.fromhex("3b11a2a1f214567e1537ce5e509ffd9b21373247f2a3ff6841f4976f53165e7e")
-        secret2 = bytes.fromhex("4c22b3b2f325678e2648df6f610aaead32484358f3b4ee7952e5a87964276f8f")
-
-        keys1 = derive_keys(secret1, NODE_A_ID, NODE_B_ID, challenge_data)
-        keys2 = derive_keys(secret2, NODE_A_ID, NODE_B_ID, challenge_data)
-
-        # Different secrets must produce different keys.
-        assert keys1 != keys2
-
-    def test_key_derivation_with_swapped_node_ids_produces_different_keys(self):
-        """Swapping initiator and recipient IDs produces different keys.
-
-        This is critical for security - the direction of the key derivation matters.
-        """
-        id_nonce = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
-        challenge_data = make_challenge_data(id_nonce)
-        secret = bytes(32)
-
-        keys_ab = derive_keys(secret, NODE_A_ID, NODE_B_ID, challenge_data)
-        keys_ba = derive_keys(secret, NODE_B_ID, NODE_A_ID, challenge_data)
-
-        # Swapped IDs must produce different keys.
-        assert keys_ab != keys_ba
-
-        # Moreover, the initiator key when A->B should equal recipient key when B->A.
-        # This ensures both sides derive the same session keys.
-        init_ab, recv_ab = keys_ab
-        init_ba, recv_ba = keys_ba
-
-        # When A initiates to B: A uses init_ab to encrypt, B uses recv_ab to decrypt.
-        # When B initiates to A: B uses init_ba to encrypt, A uses recv_ba to decrypt.
-        # These should be symmetric but the individual values differ.
-        assert init_ab != init_ba
-        assert recv_ab != recv_ba
-
 
 class TestAESCryptoEdgeCases:
     """Additional AES-GCM test cases beyond spec vectors."""
 
     def test_aes_gcm_empty_plaintext(self):
         """AES-GCM handles empty plaintext correctly."""
-        key = bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b")
-        nonce = bytes.fromhex("27b5af763c446acd2749fe8e")
         aad = bytes(32)
         plaintext = b""
 
-        ciphertext = aes_gcm_encrypt(key, nonce, plaintext, aad)
+        ciphertext = aes_gcm_encrypt(SPEC_AES_KEY, SPEC_AES_NONCE, plaintext, aad)
 
         # Empty plaintext should produce just the 16-byte auth tag.
         assert len(ciphertext) == 16
 
         # Decryption should recover empty plaintext.
-        decrypted = aes_gcm_decrypt(key, nonce, ciphertext, aad)
+        decrypted = aes_gcm_decrypt(SPEC_AES_KEY, SPEC_AES_NONCE, ciphertext, aad)
         assert decrypted == b""
 
     def test_aes_gcm_large_plaintext(self):
         """AES-GCM handles large plaintext correctly."""
-        key = bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b")
-        nonce = bytes.fromhex("27b5af763c446acd2749fe8e")
         aad = bytes(32)
         plaintext = bytes(1024)  # 1KB of zeros.
 
-        ciphertext = aes_gcm_encrypt(key, nonce, plaintext, aad)
+        ciphertext = aes_gcm_encrypt(SPEC_AES_KEY, SPEC_AES_NONCE, plaintext, aad)
 
         # Ciphertext = plaintext length + 16-byte tag.
         assert len(ciphertext) == len(plaintext) + 16
 
         # Decryption should recover original plaintext.
-        decrypted = aes_gcm_decrypt(key, nonce, ciphertext, aad)
+        decrypted = aes_gcm_decrypt(SPEC_AES_KEY, SPEC_AES_NONCE, ciphertext, aad)
         assert decrypted == plaintext
-
-    def test_aes_gcm_wrong_key_fails_decryption(self):
-        """AES-GCM decryption fails with wrong key."""
-        import pytest
-        from cryptography.exceptions import InvalidTag
-
-        key = bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b")
-        wrong_key = bytes.fromhex("00000000000000001a85107ac686990b")
-        nonce = bytes.fromhex("27b5af763c446acd2749fe8e")
-        aad = bytes(32)
-        plaintext = b"secret message"
-
-        ciphertext = aes_gcm_encrypt(key, nonce, plaintext, aad)
-
-        # Decryption with wrong key should fail with InvalidTag.
-        with pytest.raises(InvalidTag):
-            aes_gcm_decrypt(wrong_key, nonce, ciphertext, aad)
-
-    def test_aes_gcm_wrong_aad_fails_decryption(self):
-        """AES-GCM decryption fails with wrong AAD."""
-        import pytest
-        from cryptography.exceptions import InvalidTag
-
-        key = bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b")
-        nonce = bytes.fromhex("27b5af763c446acd2749fe8e")
-        aad = bytes(32)
-        wrong_aad = bytes([0xFF] * 32)
-        plaintext = b"secret message"
-
-        ciphertext = aes_gcm_encrypt(key, nonce, plaintext, aad)
-
-        # Decryption with wrong AAD should fail with InvalidTag.
-        with pytest.raises(InvalidTag):
-            aes_gcm_decrypt(key, nonce, ciphertext, wrong_aad)
 
     def test_aes_gcm_tampered_ciphertext_fails(self):
         """AES-GCM decryption fails with tampered ciphertext."""
-        import pytest
-        from cryptography.exceptions import InvalidTag
-
-        key = bytes.fromhex("9f2d77db7004bf8a1a85107ac686990b")
-        nonce = bytes.fromhex("27b5af763c446acd2749fe8e")
         aad = bytes(32)
         plaintext = b"secret message"
 
-        ciphertext = aes_gcm_encrypt(key, nonce, plaintext, aad)
+        ciphertext = aes_gcm_encrypt(SPEC_AES_KEY, SPEC_AES_NONCE, plaintext, aad)
 
         # Tamper with ciphertext by flipping a bit.
         tampered = bytearray(ciphertext)
@@ -1012,4 +766,78 @@ class TestAESCryptoEdgeCases:
 
         # Decryption of tampered ciphertext should fail with InvalidTag.
         with pytest.raises(InvalidTag):
-            aes_gcm_decrypt(key, nonce, tampered, aad)
+            aes_gcm_decrypt(SPEC_AES_KEY, SPEC_AES_NONCE, tampered, aad)
+
+
+class TestSpecPacketPayloadDecryption:
+    """Verify message payload decryption using correct AAD (masking-iv || plaintext header)."""
+
+    def test_message_packet_encrypt_decrypt_roundtrip(self):
+        """Encrypt a message in a packet and decrypt using message_ad from decode."""
+        nonce = Nonce(bytes(12))
+
+        authdata = encode_message_authdata(NODE_A_ID)
+
+        packet = encode_packet(
+            dest_node_id=NODE_B_ID,
+            flag=PacketFlag.MESSAGE,
+            nonce=nonce,
+            authdata=authdata,
+            message=SPEC_PING_PLAINTEXT,
+            encryption_key=SPEC_INITIATOR_KEY,
+        )
+
+        # Decode header - returns message_ad for AAD.
+        header, ciphertext, message_ad = decode_packet_header(NODE_B_ID, packet)
+
+        # Decrypt using message_ad as AAD.
+        decrypted = decrypt_message(SPEC_INITIATOR_KEY, header.nonce, ciphertext, message_ad)
+        assert decrypted == SPEC_PING_PLAINTEXT
+
+    def test_handshake_packet_encrypt_decrypt_roundtrip(self):
+        """Handshake packet encrypts and decrypts using correct AAD."""
+        nonce = Nonce(bytes(12))
+
+        id_signature = Bytes64(bytes(64))
+        eph_pubkey = Bytes33(
+            bytes.fromhex("039a003ba6517b473fa0cd74aefe99dadfdb34627f90fec6362df85803908f53a5")
+        )
+
+        authdata = encode_handshake_authdata(
+            src_id=NODE_A_ID,
+            id_signature=id_signature,
+            eph_pubkey=eph_pubkey,
+            record=None,
+        )
+
+        packet = encode_packet(
+            dest_node_id=NODE_B_ID,
+            flag=PacketFlag.HANDSHAKE,
+            nonce=nonce,
+            authdata=authdata,
+            message=SPEC_PING_PLAINTEXT,
+            encryption_key=SPEC_INITIATOR_KEY,
+        )
+
+        # Decode header - returns message_ad for AAD.
+        header, ciphertext, message_ad = decode_packet_header(NODE_B_ID, packet)
+
+        # Decrypt using message_ad as AAD.
+        decrypted = decrypt_message(SPEC_INITIATOR_KEY, header.nonce, ciphertext, message_ad)
+        assert decrypted == SPEC_PING_PLAINTEXT
+
+
+class TestRoutingWithTestVectorNodeIds:
+    """Tests using official test vector node IDs with routing functions."""
+
+    def test_xor_distance_is_symmetric(self):
+        """XOR distance between test vector nodes is symmetric and non-zero."""
+        distance = xor_distance(NODE_A_ID, NODE_B_ID)
+        assert distance > 0
+        assert xor_distance(NODE_A_ID, NODE_B_ID) == xor_distance(NODE_B_ID, NODE_A_ID)
+
+    def test_log2_distance_is_high(self):
+        """Log2 distance between test vector nodes is high (differ in high bits)."""
+
+        log_dist = log2_distance(NODE_A_ID, NODE_B_ID)
+        assert log_dist > Distance(200)

@@ -9,7 +9,8 @@ This module provides two parameterized SSZ types:
 
 from __future__ import annotations
 
-from typing import IO, Any, ClassVar, Iterable, Self, SupportsIndex
+from collections.abc import Iterable
+from typing import IO, Any, ClassVar, Self, SupportsIndex
 
 from pydantic import Field, field_serializer, field_validator
 from pydantic.annotated_handlers import GetCoreSchemaHandler
@@ -17,30 +18,6 @@ from pydantic_core import core_schema
 
 from .exceptions import SSZSerializationError, SSZTypeError, SSZValueError
 from .ssz_base import SSZModel, SSZType
-
-
-def _coerce_to_bytes(value: Any) -> bytes:
-    """
-    Coerce a variety of inputs to raw bytes.
-
-    Accepts:
-      - `bytes` / `bytearray` (returned as immutable `bytes`)
-      - Iterables of integers in [0, 255]
-      - Hex strings, with or without a '0x' prefix (e.g. "0xdeadbeef" or "deadbeef")
-
-    Raises:
-      ValueError / TypeError if conversion is not possible or out-of-range.
-    """
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value)
-    if isinstance(value, str):
-        # bytes.fromhex handles empty string and validates hex characters
-        return bytes.fromhex(value.removeprefix("0x"))
-    if isinstance(value, Iterable):
-        # bytes(bytearray(iterable)) enforces each element is an int in 0..255
-        return bytes(bytearray(value))
-    # Fall back to Python's bytes() constructor (will raise if unsupported)
-    return bytes(value)
 
 
 class BaseBytes(bytes, SSZType):
@@ -53,8 +30,31 @@ class BaseBytes(bytes, SSZType):
     Instances are immutable byte objects with strict length checking.
     """
 
+    __slots__ = ()
+
     LENGTH: ClassVar[int]
     """The exact number of bytes (overridden by subclasses)."""
+
+    @staticmethod
+    def _coerce_to_bytes(value: Any) -> bytes:
+        """
+        Coerce a variety of inputs to raw bytes.
+
+        Accepts:
+          - `bytes` / `bytearray` (returned as immutable `bytes`)
+          - Iterables of integers in [0, 255]
+          - Hex strings, with or without a '0x' prefix (e.g. "0xdeadbeef" or "deadbeef")
+
+        Raises:
+          ValueError / TypeError if conversion is not possible or out-of-range.
+        """
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            return bytes.fromhex(value.removeprefix("0x"))
+        if isinstance(value, Iterable):
+            return bytes(bytearray(value))
+        raise TypeError(f"Cannot coerce {type(value).__name__} to bytes")
 
     def __new__(cls, value: Any = b"") -> Self:
         """
@@ -64,13 +64,13 @@ class BaseBytes(bytes, SSZType):
             value: Any value coercible to bytes (see `_coerce_to_bytes`).
 
         Raises:
-            SSZTypeDefinitionError: If the class doesn't define LENGTH.
-            SSZLengthError: If the resulting byte length differs from `LENGTH`.
+            SSZTypeError: If the class doesn't define LENGTH.
+            SSZValueError: If the resulting byte length differs from `LENGTH`.
         """
         if not hasattr(cls, "LENGTH"):
             raise SSZTypeError(f"{cls.__name__} must define LENGTH")
 
-        b = _coerce_to_bytes(value)
+        b = cls._coerce_to_bytes(value)
         if len(b) != cls.LENGTH:
             raise SSZValueError(f"{cls.__name__} requires exactly {cls.LENGTH} bytes, got {len(b)}")
         return super().__new__(cls, b)
@@ -113,8 +113,7 @@ class BaseBytes(bytes, SSZType):
         For a fixed-size type, `scope` must match `LENGTH`.
 
         Raises:
-            SSZDecodeError: if `scope` != `LENGTH`.
-            SSZStreamError: if the stream ends prematurely.
+            SSZSerializationError: if `scope` != `LENGTH` or the stream ends prematurely.
         """
         if scope != cls.LENGTH:
             raise SSZSerializationError(f"{cls.__name__}: expected {cls.LENGTH} bytes, got {scope}")
@@ -202,6 +201,12 @@ class Bytes4(BaseBytes):
     LENGTH = 4
 
 
+class Bytes12(BaseBytes):
+    """Fixed-size byte array of exactly 12 bytes (AES-GCM nonce)."""
+
+    LENGTH = 12
+
+
 class Bytes16(BaseBytes):
     """Fixed-size byte array of exactly 16 bytes (Poly1305 authentication tag)."""
 
@@ -242,6 +247,12 @@ class Bytes64(BaseBytes):
     LENGTH = 64
 
 
+class Bytes65(BaseBytes):
+    """Fixed-size byte array of exactly 65 bytes (uncompressed secp256k1 public key)."""
+
+    LENGTH = 65
+
+
 class BaseByteList(SSZModel):
     """
     Base class for specialized `ByteList[L]`.
@@ -265,7 +276,7 @@ class BaseByteList(SSZModel):
         if not hasattr(cls, "LIMIT"):
             raise SSZTypeError(f"{cls.__name__} must define LIMIT")
 
-        b = _coerce_to_bytes(v)
+        b = BaseBytes._coerce_to_bytes(v)
         if len(b) > cls.LIMIT:
             raise SSZValueError(f"{cls.__name__} exceeds limit of {cls.LIMIT}, got {len(b)}")
         return b
@@ -304,9 +315,8 @@ class BaseByteList(SSZModel):
         knows how many bytes belong to this value in its context).
 
         Raises:
-            SSZDecodeError: if the scope is negative.
-            SSZLengthError: if the decoded length exceeds `LIMIT`.
-            SSZStreamError: if the stream ends prematurely.
+            SSZSerializationError: if the scope is negative or the stream ends prematurely.
+            SSZValueError: if the decoded length exceeds `LIMIT`.
         """
         if scope < 0:
             raise SSZSerializationError(f"{cls.__name__}: negative scope")
