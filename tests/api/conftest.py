@@ -53,10 +53,16 @@ class _ServerThread(threading.Thread):
         return ApiServer(config=config, store_getter=lambda: store)
 
     def stop(self) -> None:
-        """Stop the server and event loop."""
+        """Stop the server and event loop, awaiting cleanup so _async_stop is run."""
         if self.server and self.loop:
-            self.loop.call_soon_threadsafe(self.server.stop)
-            self.loop.call_soon_threadsafe(self.loop.stop)
+
+            async def shutdown() -> None:
+                if self.server:
+                    await self.server.aclose()
+                self.loop.stop()
+
+            future = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
+            future.result(timeout=5.0)
 
 
 def _wait_for_server(url: str, timeout: float = 5.0) -> bool:

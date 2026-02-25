@@ -11,8 +11,6 @@ These tests cover leanSpec-specific implementation details:
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 
 from lean_spec.subspecs.api import ApiServer, ApiServerConfig
@@ -79,8 +77,7 @@ class TestFinalizedStateEndpoint:
                 assert response.status_code == 503
 
         finally:
-            server.stop()
-            await asyncio.sleep(0.1)
+            await server.aclose()
 
 
 class TestJustifiedCheckpointEndpoint:
@@ -100,5 +97,4 @@ class TestJustifiedCheckpointEndpoint:
                 assert response.status_code == 503
 
         finally:
-            server.stop()
-            await asyncio.sleep(0.1)
+            await server.aclose()

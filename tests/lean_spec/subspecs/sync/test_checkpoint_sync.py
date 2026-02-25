@@ -77,5 +77,4 @@ class TestCheckpointSyncClientServerIntegration:
             assert is_valid is True
 
         finally:
-            server.stop()
-            await asyncio.sleep(0.1)
+            await server.aclose()
