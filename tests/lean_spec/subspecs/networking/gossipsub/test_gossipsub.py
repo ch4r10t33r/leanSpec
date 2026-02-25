@@ -24,6 +24,7 @@ from lean_spec.subspecs.networking.gossipsub.rpc import (
     Message,
     SubOpts,
 )
+from lean_spec.subspecs.networking.gossipsub.types import TopicId
 
 
 def peer(name: str) -> PeerId:
@@ -62,7 +63,7 @@ class TestControlMessages:
         empty_control = ControlMessage()
         assert empty_control.is_empty()
 
-        non_empty = ControlMessage(graft=[ControlGraft(topic_id="topic")])
+        non_empty = ControlMessage(graft=[ControlGraft(topic_id=TopicId("topic"))])
         assert not non_empty.is_empty()
 
 
@@ -166,48 +167,48 @@ class TestMeshState:
         """Test topic subscription."""
         mesh = MeshState(params=GossipsubParameters())
 
-        mesh.subscribe("topic1")
-        assert "topic1" in mesh.subscriptions
-        assert "topic2" not in mesh.subscriptions
+        mesh.subscribe(TopicId("topic1"))
+        assert TopicId("topic1") in mesh.subscriptions
+        assert TopicId("topic2") not in mesh.subscriptions
 
-        peers = mesh.unsubscribe("topic1")
-        assert "topic1" not in mesh.subscriptions
+        peers = mesh.unsubscribe(TopicId("topic1"))
+        assert TopicId("topic1") not in mesh.subscriptions
         assert peers == set()
 
     def test_add_remove_mesh_peers(self) -> None:
         """Test adding and removing peers from mesh."""
         mesh = MeshState(params=GossipsubParameters())
-        mesh.subscribe("topic1")
+        mesh.subscribe(TopicId("topic1"))
 
         peer1 = peer("peer1")
         peer2 = peer("peer2")
 
-        assert mesh.add_to_mesh("topic1", peer1)
-        assert mesh.add_to_mesh("topic1", peer2)
-        assert not mesh.add_to_mesh("topic1", peer1)  # Already in mesh
+        assert mesh.add_to_mesh(TopicId("topic1"), peer1)
+        assert mesh.add_to_mesh(TopicId("topic1"), peer2)
+        assert not mesh.add_to_mesh(TopicId("topic1"), peer1)  # Already in mesh
 
-        assert mesh.get_mesh_peers("topic1") == {peer1, peer2}
+        assert mesh.get_mesh_peers(TopicId("topic1")) == {peer1, peer2}
 
-        assert mesh.remove_from_mesh("topic1", peer1)
-        assert not mesh.remove_from_mesh("topic1", peer1)  # Already removed
+        assert mesh.remove_from_mesh(TopicId("topic1"), peer1)
+        assert not mesh.remove_from_mesh(TopicId("topic1"), peer1)  # Already removed
 
-        assert mesh.get_mesh_peers("topic1") == {peer2}
+        assert mesh.get_mesh_peers(TopicId("topic1")) == {peer2}
 
     def test_gossip_peer_selection(self) -> None:
         """Test selection of non-mesh peers for gossip."""
         params = GossipsubParameters(d_lazy=3)
         mesh = MeshState(params=params)
-        mesh.subscribe("topic1")
+        mesh.subscribe(TopicId("topic1"))
         peer1 = peer("peer1")
         peer2 = peer("peer2")
-        mesh.add_to_mesh("topic1", peer1)
-        mesh.add_to_mesh("topic1", peer2)
+        mesh.add_to_mesh(TopicId("topic1"), peer1)
+        mesh.add_to_mesh(TopicId("topic1"), peer2)
 
         # Exactly d_lazy=3 non-mesh peers → all returned deterministically.
         non_mesh = {peer("peer3"), peer("peer4"), peer("peer5")}
         all_peers = {peer1, peer2} | non_mesh
 
-        gossip_peers = mesh.select_peers_for_gossip("topic1", all_peers)
+        gossip_peers = mesh.select_peers_for_gossip(TopicId("topic1"), all_peers)
 
         assert set(gossip_peers) == non_mesh
 
@@ -247,7 +248,7 @@ class TestFanoutOperations:
     def test_update_fanout_creates_entry(self) -> None:
         """update_fanout creates a new fanout entry if none exists."""
         mesh = MeshState(params=GossipsubParameters(d=3))
-        topic = "fanout_topic"
+        topic = TopicId("fanout_topic")
 
         available = {peer("p1"), peer("p2"), peer("p3"), peer("p4")}
         result = mesh.update_fanout(topic, available)
@@ -258,7 +259,7 @@ class TestFanoutOperations:
     def test_update_fanout_returns_mesh_if_subscribed(self) -> None:
         """update_fanout returns mesh peers for subscribed topics."""
         mesh = MeshState(params=GossipsubParameters(d=3))
-        topic = "sub_topic"
+        topic = TopicId("sub_topic")
 
         mesh.subscribe(topic)
         p1 = peer("p1")
@@ -270,7 +271,7 @@ class TestFanoutOperations:
     def test_update_fanout_fills_to_d(self) -> None:
         """update_fanout fills fanout up to D peers."""
         mesh = MeshState(params=GossipsubParameters(d=4))
-        topic = "fanout_topic"
+        topic = TopicId("fanout_topic")
 
         names = ["pA", "pB", "pC", "pD", "pE", "pF", "pG", "pH", "pJ", "pK"]
         available = {peer(n) for n in names}
@@ -281,7 +282,7 @@ class TestFanoutOperations:
     def test_cleanup_fanouts_removes_stale(self) -> None:
         """cleanup_fanouts removes stale entries."""
         mesh = MeshState(params=GossipsubParameters())
-        topic = "old_topic"
+        topic = TopicId("old_topic")
 
         mesh.update_fanout(topic, {peer("p1")})
         # Make it stale
@@ -294,7 +295,7 @@ class TestFanoutOperations:
     def test_cleanup_fanouts_keeps_fresh(self) -> None:
         """cleanup_fanouts keeps recent entries."""
         mesh = MeshState(params=GossipsubParameters())
-        topic = "fresh_topic"
+        topic = TopicId("fresh_topic")
 
         mesh.update_fanout(topic, {peer("p1")})
         # last_published is set to time.time() by update_fanout
@@ -306,7 +307,7 @@ class TestFanoutOperations:
     def test_subscribe_promotes_fanout_to_mesh(self) -> None:
         """Subscribing to a topic promotes fanout peers to mesh."""
         mesh = MeshState(params=GossipsubParameters())
-        topic = "promote_topic"
+        topic = TopicId("promote_topic")
 
         p1 = peer("p1")
         mesh.update_fanout(topic, {p1})
@@ -321,7 +322,7 @@ class TestFanoutOperations:
     def test_unsubscribe_returns_mesh_peers(self) -> None:
         """Unsubscribing returns the set of mesh peers (for PRUNE)."""
         mesh = MeshState(params=GossipsubParameters())
-        topic = "unsub_topic"
+        topic = TopicId("unsub_topic")
 
         mesh.subscribe(topic)
         p1 = peer("p1")
@@ -336,11 +337,11 @@ class TestFanoutOperations:
         """Gossip peer selection returns at most d_lazy peers."""
         params = GossipsubParameters(d_lazy=2)
         mesh = MeshState(params=params)
-        mesh.subscribe("topic")
+        mesh.subscribe(TopicId("topic"))
 
         names = ["gA", "gB", "gC", "gD", "gE", "gF", "gG", "gH", "gJ", "gK"]
         all_peers = {peer(n) for n in names}
-        result = mesh.select_peers_for_gossip("topic", all_peers)
+        result = mesh.select_peers_for_gossip(TopicId("topic"), all_peers)
 
         assert len(result) <= 2
 
@@ -348,13 +349,13 @@ class TestFanoutOperations:
         """Gossip peer selection excludes mesh peers."""
         params = GossipsubParameters(d_lazy=5)
         mesh = MeshState(params=params)
-        mesh.subscribe("topic")
+        mesh.subscribe(TopicId("topic"))
 
         mesh_peer = peer("mesh1")
-        mesh.add_to_mesh("topic", mesh_peer)
+        mesh.add_to_mesh(TopicId("topic"), mesh_peer)
 
         all_peers = {mesh_peer, peer("p1"), peer("p2")}
-        result = mesh.select_peers_for_gossip("topic", all_peers)
+        result = mesh.select_peers_for_gossip(TopicId("topic"), all_peers)
 
         assert mesh_peer not in result
 
@@ -368,10 +369,13 @@ class TestRPCProtobufEncoding:
 
     def test_subopts_encode_decode(self) -> None:
         """Test SubOpts (subscription) encoding/decoding."""
-        sub = SubOpts(subscribe=True, topic_id="/leanconsensus/0x12345678/blocks/ssz_snappy")
+        sub = SubOpts(
+            subscribe=True,
+            topic_id=TopicId("/leanconsensus/0x12345678/blocks/ssz_snappy"),
+        )
         assert SubOpts.decode(sub.encode()) == sub
 
-        unsub = SubOpts(subscribe=False, topic_id="/test/topic")
+        unsub = SubOpts(subscribe=False, topic_id=TopicId("/test/topic"))
         assert SubOpts.decode(unsub.encode()) == unsub
 
     def test_message_encode_decode(self) -> None:
@@ -380,7 +384,7 @@ class TestRPCProtobufEncoding:
             from_peer=b"peer123",
             data=b"hello world",
             seqno=b"\x00\x01\x02\x03\x04\x05\x06\x07",
-            topic="/test/topic",
+            topic=TopicId("/test/topic"),
             signature=b"sig" * 16,
             key=b"pubkey",
         )
@@ -388,23 +392,23 @@ class TestRPCProtobufEncoding:
 
     def test_message_minimal(self) -> None:
         """Test Message with only required fields."""
-        msg = Message(topic="/test/topic", data=b"payload")
+        msg = Message(topic=TopicId("/test/topic"), data=b"payload")
         assert Message.decode(msg.encode()) == msg
 
     def test_control_graft_encode_decode(self) -> None:
         """Test ControlGraft encoding/decoding."""
-        graft = ControlGraft(topic_id="/test/blocks")
+        graft = ControlGraft(topic_id=TopicId("/test/blocks"))
         assert ControlGraft.decode(graft.encode()) == graft
 
     def test_control_prune_encode_decode(self) -> None:
         """Test ControlPrune encoding/decoding with backoff."""
-        prune = ControlPrune(topic_id="/test/blocks", backoff=60)
+        prune = ControlPrune(topic_id=TopicId("/test/blocks"), backoff=60)
         assert ControlPrune.decode(prune.encode()) == prune
 
     def test_control_ihave_encode_decode(self) -> None:
         """Test ControlIHave encoding/decoding."""
         ihave = ControlIHave(
-            topic_id="/test/blocks",
+            topic_id=TopicId("/test/blocks"),
             message_ids=[b"msgid1234567890ab", b"msgid2345678901bc", b"msgid3456789012cd"],
         )
         assert ControlIHave.decode(ihave.encode()) == ihave
@@ -422,9 +426,9 @@ class TestRPCProtobufEncoding:
     def test_control_message_aggregate(self) -> None:
         """Test ControlMessage with multiple control types."""
         ctrl = ControlMessage(
-            graft=[ControlGraft(topic_id="/topic1")],
-            prune=[ControlPrune(topic_id="/topic2", backoff=30)],
-            ihave=[ControlIHave(topic_id="/topic1", message_ids=[b"msg123456789012"])],
+            graft=[ControlGraft(topic_id=TopicId("/topic1"))],
+            prune=[ControlPrune(topic_id=TopicId("/topic2"), backoff=30)],
+            ihave=[ControlIHave(topic_id=TopicId("/topic1"), message_ids=[b"msg123456789012"])],
         )
         assert ControlMessage.decode(ctrl.encode()) == ctrl
 
@@ -432,8 +436,8 @@ class TestRPCProtobufEncoding:
         """Test RPC with only subscriptions."""
         rpc = RPC(
             subscriptions=[
-                SubOpts(subscribe=True, topic_id="/topic1"),
-                SubOpts(subscribe=False, topic_id="/topic2"),
+                SubOpts(subscribe=True, topic_id=TopicId("/topic1")),
+                SubOpts(subscribe=False, topic_id=TopicId("/topic2")),
             ]
         )
         assert RPC.decode(rpc.encode()) == rpc
@@ -442,25 +446,27 @@ class TestRPCProtobufEncoding:
         """Test RPC with only published messages."""
         rpc = RPC(
             publish=[
-                Message(topic="/blocks", data=b"block_data_1"),
-                Message(topic="/attestations", data=b"attestation_data"),
+                Message(topic=TopicId("/blocks"), data=b"block_data_1"),
+                Message(topic=TopicId("/attestations"), data=b"attestation_data"),
             ]
         )
         assert RPC.decode(rpc.encode()) == rpc
 
     def test_rpc_control_only(self) -> None:
         """Test RPC with only control messages."""
-        rpc = RPC(control=ControlMessage(graft=[ControlGraft(topic_id="/blocks")]))
+        rpc = RPC(control=ControlMessage(graft=[ControlGraft(topic_id=TopicId("/blocks"))]))
         assert RPC.decode(rpc.encode()) == rpc
 
     def test_rpc_full_message(self) -> None:
         """Test RPC with all message types (full gossipsub exchange)."""
         rpc = RPC(
-            subscriptions=[SubOpts(subscribe=True, topic_id="/blocks")],
-            publish=[Message(topic="/blocks", data=b"block_payload")],
+            subscriptions=[SubOpts(subscribe=True, topic_id=TopicId("/blocks"))],
+            publish=[Message(topic=TopicId("/blocks"), data=b"block_payload")],
             control=ControlMessage(
-                graft=[ControlGraft(topic_id="/blocks")],
-                ihave=[ControlIHave(topic_id="/blocks", message_ids=[b"msgid123456789ab"])],
+                graft=[ControlGraft(topic_id=TopicId("/blocks"))],
+                ihave=[
+                    ControlIHave(topic_id=TopicId("/blocks"), message_ids=[b"msgid123456789ab"])
+                ],
             ),
         )
         assert RPC.decode(rpc.encode()) == rpc
@@ -470,20 +476,20 @@ class TestRPCProtobufEncoding:
         empty_rpc = RPC()
         assert empty_rpc.is_empty()
 
-        non_empty = RPC(subscriptions=[SubOpts(subscribe=True, topic_id="/topic")])
+        non_empty = RPC(subscriptions=[SubOpts(subscribe=True, topic_id=TopicId("/topic"))])
         assert not non_empty.is_empty()
 
     def test_rpc_helper_functions(self) -> None:
         """Test RPC creation helper functions."""
-        assert RPC.subscription(["/topic1", "/topic2"], subscribe=True) == RPC(
+        assert RPC.subscription([TopicId("/topic1"), TopicId("/topic2")], subscribe=True) == RPC(
             subscriptions=[
-                SubOpts(subscribe=True, topic_id="/topic1"),
-                SubOpts(subscribe=True, topic_id="/topic2"),
+                SubOpts(subscribe=True, topic_id=TopicId("/topic1")),
+                SubOpts(subscribe=True, topic_id=TopicId("/topic2")),
             ]
         )
 
-        assert RPC.graft(["/topic1"]) == RPC(
-            control=ControlMessage(graft=[ControlGraft(topic_id="/topic1")])
+        assert RPC.graft([TopicId("/topic1")]) == RPC(
+            control=ControlMessage(graft=[ControlGraft(topic_id=TopicId("/topic1"))])
         )
 
     def test_wire_format_compatibility(self) -> None:
@@ -492,12 +498,12 @@ class TestRPCProtobufEncoding:
         Verifies that our encoding produces bytes that round-trip
         correctly through decode, matching the original structure.
         """
-        rpc = RPC(subscriptions=[SubOpts(subscribe=True, topic_id="test")])
+        rpc = RPC(subscriptions=[SubOpts(subscribe=True, topic_id=TopicId("test"))])
         assert RPC.decode(rpc.encode()) == rpc
 
     def test_large_message_encoding(self) -> None:
         """Test encoding of large messages (typical block size)."""
-        rpc = RPC(publish=[Message(topic="/blocks", data=b"x" * 100_000)])
+        rpc = RPC(publish=[Message(topic=TopicId("/blocks"), data=b"x" * 100_000)])
         assert RPC.decode(rpc.encode()) == rpc
 
 

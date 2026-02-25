@@ -85,7 +85,7 @@ from lean_spec.subspecs.networking.gossipsub.rpc import (
     Message,
     SubOpts,
 )
-from lean_spec.subspecs.networking.gossipsub.types import MessageId
+from lean_spec.subspecs.networking.gossipsub.types import MessageId, Timestamp, TopicId
 from lean_spec.subspecs.networking.transport import PeerId
 from lean_spec.subspecs.networking.transport.quic.stream_adapter import QuicStreamAdapter
 from lean_spec.subspecs.networking.varint import decode_varint, encode_varint
@@ -117,7 +117,7 @@ class GossipsubMessageEvent:
     peer_id: PeerId
     """Peer that sent the message."""
 
-    topic: str
+    topic: TopicId
     """Topic the message belongs to."""
 
     data: bytes
@@ -134,7 +134,7 @@ class GossipsubPeerEvent:
     peer_id: PeerId
     """Peer whose subscription changed."""
 
-    topic: str
+    topic: TopicId
     """Topic affected."""
 
     subscribed: bool
@@ -256,7 +256,7 @@ class GossipsubBehavior:
         )
         self.seen_cache = SeenCache(ttl_seconds=self.params.seen_ttl_secs)
 
-    def subscribe(self, topic: str) -> None:
+    def subscribe(self, topic: TopicId) -> None:
         """Subscribe to a topic.
 
         Joining a topic means:
@@ -279,7 +279,7 @@ class GossipsubBehavior:
         if self._running:
             self._spawn_background_task(self._broadcast_subscription(topic, subscribe=True))
 
-    def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: TopicId) -> None:
         """Unsubscribe from a topic.
 
         Leaving a topic means:
@@ -428,7 +428,7 @@ class GossipsubBehavior:
 
         logger.info("Removed gossipsub peer %s", peer_id)
 
-    async def publish(self, topic: str, data: bytes) -> None:
+    async def publish(self, topic: TopicId, data: bytes) -> None:
         """Publish a message to a topic.
 
         Sends the message to mesh peers, or fanout peers if not subscribed.
@@ -453,7 +453,7 @@ class GossipsubBehavior:
             logger.debug("Skipping duplicate message %s", msg_id.hex()[:8])
             return
 
-        self.seen_cache.add(msg_id, time.time())
+        self.seen_cache.add(msg_id, Timestamp(time.time()))
 
         # Cache stores compressed data for IWANT responses.
         cache_msg = GossipsubMessage(topic=topic_bytes, raw_data=data)
@@ -567,7 +567,7 @@ class GossipsubBehavior:
         else:
             state.subscriptions.discard(sub.topic_id)
             # A peer that leaves a topic can't be a mesh member for it.
-            self.mesh.remove_from_mesh(sub.topic_id, peer_id)
+            self.mesh.remove_from_mesh(TopicId(sub.topic_id), peer_id)
             logger.debug("Peer %s unsubscribed from %s", peer_id, sub.topic_id)
 
         await self._event_queue.put(
@@ -592,16 +592,16 @@ class GossipsubBehavior:
         # Deduplicate: each message is processed at most once.
         if self.seen_cache.has(msg_id):
             return
-        self.seen_cache.add(msg_id, time.time())
+        self.seen_cache.add(msg_id, Timestamp(time.time()))
 
         # Cache stores compressed data for IWANT responses.
         cache_msg = GossipsubMessage(topic=topic_bytes, raw_data=msg.data)
         cache_msg._cached_id = msg_id
-        self.message_cache.put(msg.topic, cache_msg)
+        self.message_cache.put(TopicId(msg.topic), cache_msg)
 
         # Only forward on topics we participate in (have a mesh for).
         if msg.topic in self.mesh.subscriptions:
-            mesh_peers = self.mesh.get_mesh_peers(msg.topic)
+            mesh_peers = self.mesh.get_mesh_peers(TopicId(msg.topic))
             forward_rpc = RPC(publish=[msg])
 
             for mesh_peer in mesh_peers:
@@ -660,7 +660,7 @@ class GossipsubBehavior:
         for idontwant in control.idontwant:
             self._handle_idontwant(peer_id, idontwant)
 
-    async def _reject_graft(self, peer_id: PeerId, topic: str) -> None:
+    async def _reject_graft(self, peer_id: PeerId, topic: TopicId) -> None:
         """Send a PRUNE rejection in response to an unacceptable GRAFT."""
         prune_rpc = RPC(
             control=ControlMessage(prune=[ControlPrune(topic_id=topic, backoff=PRUNE_BACKOFF)])
@@ -739,7 +739,8 @@ class GossipsubBehavior:
             msg_id_typed = MessageId(msg_id)
             cached = self.message_cache.get(msg_id_typed)
             if cached:
-                messages.append(Message(topic=cached.topic.decode("utf-8"), data=cached.raw_data))
+                topic_id = TopicId(cached.topic.decode("utf-8"))
+                messages.append(Message(topic=topic_id, data=cached.raw_data))
 
         if messages:
             rpc = RPC(publish=messages)
@@ -812,7 +813,7 @@ class GossipsubBehavior:
         for state in self._peers.values():
             state.dont_want_ids.clear()
 
-    async def _maintain_mesh(self, topic: str, now: float) -> None:
+    async def _maintain_mesh(self, topic: TopicId, now: float) -> None:
         """Maintain mesh size for a topic."""
         mesh_peers = self.mesh.get_mesh_peers(topic)
         mesh_size = len(mesh_peers)
@@ -861,7 +862,7 @@ class GossipsubBehavior:
 
             logger.debug("PRUNE %d peers for topic %s", len(to_prune), topic)
 
-    async def _emit_gossip(self, topic: str) -> None:
+    async def _emit_gossip(self, topic: TopicId) -> None:
         """Send IHAVE gossip to non-mesh peers."""
         msg_ids = self.message_cache.get_gossip_ids(topic)
         if not msg_ids:
@@ -978,7 +979,7 @@ class GossipsubBehavior:
 
     async def _broadcast_subscription(
         self,
-        topic: str,
+        topic: TopicId,
         subscribe: bool,
         prune_peers: set[PeerId] | None = None,
     ) -> None:
