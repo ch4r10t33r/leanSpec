@@ -59,10 +59,15 @@ class _ServerThread(threading.Thread):
             async def shutdown() -> None:
                 if self.server:
                     await self.server.aclose()
-                self.loop.stop()
+                if self.loop and self.loop.is_running():
+                    self.loop.stop()
 
             future = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
-            future.result(timeout=5.0)
+            try:
+                future.result(timeout=5.0)
+            except TimeoutError:
+                if self.loop and self.loop.is_running():
+                    self.loop.call_soon_threadsafe(self.loop.stop)
 
 
 def _wait_for_server(url: str, timeout: float = 5.0) -> bool:

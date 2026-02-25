@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import MagicMock
 
 from lean_spec.subspecs.api import ApiServer, ApiServerConfig
