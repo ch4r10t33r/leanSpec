@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from lean_spec.subspecs.containers import State, Validator
 from lean_spec.subspecs.containers.state import Validators
@@ -28,18 +28,11 @@ class GenesisConfig(StrictBaseModel):
     """
     Configuration that establishes the birth of an Ethereum consensus chain.
 
-    Genesis is the shared starting point for all participants in the network.
-    Without a common genesis, nodes cannot agree on the chain's history.
-    Every block traces its ancestry back to this origin.
-
-    The genesis configuration solves two fundamental coordination problems:
-
-    - Time Synchronization: All nodes agree on when slots begin
-    - Initial Trust: Bootstrap validators that can produce and attest blocks
-
-    Field names use UPPERCASE to match cross-client YAML convention.
-    Pydantic aliases map them to snake_case Python attributes.
+    Ignores extra YAML keys (e.g. ACTIVE_EPOCH, VALIDATOR_COUNT) so configs
+    from lean-quickstart and other generators load without error.
     """
+
+    model_config = StrictBaseModel.model_config | {"extra": "ignore"}
 
     genesis_time: Uint64 = Field(alias="GENESIS_TIME")
     """
