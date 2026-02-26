@@ -37,7 +37,7 @@ def load_test_file(filename: str, size_limit: int = 0) -> bytes:
     return data
 
 
-# Test data files as defined in the C++ test suite (alice29.txt omitted - not in repo)
+# Test data files as defined in the C++ test suite
 TEST_DATA_FILES = [
     ("html", "html", 0),
     ("urls", "urls.10K", 0),
@@ -45,6 +45,7 @@ TEST_DATA_FILES = [
     ("jpg_200", "fireworks.jpeg", 200),
     ("pdf", "paper-100k.pdf", 0),
     ("html4", "html_x_4", 0),
+    ("txt1", "alice29.txt", 0),
     ("txt2", "asyoulik.txt", 0),
     ("txt3", "lcet10.txt", 0),
     ("txt4", "plrabn12.txt", 0),
