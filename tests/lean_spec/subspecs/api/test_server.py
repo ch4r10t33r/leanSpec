@@ -11,6 +11,8 @@ These tests cover leanSpec-specific implementation details:
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
 from lean_spec.subspecs.api import ApiServer, ApiServerConfig
