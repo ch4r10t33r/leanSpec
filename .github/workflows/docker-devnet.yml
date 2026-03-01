@@ -1,24 +1,30 @@
-# Build and publish leanSpec node image when a PR targets a devnet branch.
-# Image is tagged with the base branch name (e.g. ghcr.io/leanethereum/leanspec-node:devnet3).
+# Build and publish leanSpec node image when:
+# - A PR targets a devnet branch (base = devnet3, devnet4, ...), or
+# - A push is made to a devnet branch (devnet3, devnet4, ...).
+# Image is tagged with the branch name (e.g. ghcr.io/leanethereum/leanspec-node:devnet3).
 name: Docker (devnet)
 
 on:
   pull_request:
     types: [opened, synchronize]
+  push:
+    branches: ["devnet*"]
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.base_ref }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.base_ref || github.ref_name }}-${{ github.head_ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
   docker-devnet:
     name: Build and push Docker image (devnet)
     runs-on: ubuntu-latest
-    if: startsWith(github.base_ref, 'devnet')
+    if: |
+      (github.event_name == 'pull_request' && startsWith(github.base_ref, 'devnet')) ||
+      (github.event_name == 'push' && startsWith(github.ref_name, 'devnet'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,6 +49,6 @@ jobs:
           target: node
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/leanethereum/leanspec-node:${{ github.base_ref }}
+          tags: ghcr.io/leanethereum/leanspec-node:${{ github.event_name == 'pull_request' && github.base_ref || github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
